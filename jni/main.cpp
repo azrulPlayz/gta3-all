@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <link.h>
 #include <mod/amlmod.h>
 #include <mod/logger.h>
 
@@ -21,9 +22,10 @@ static const bool ON_CAMERA  = true;
 static const bool ON_WITNESS = true;
 static const bool ON_RAGDOLL_PROBE = false;  // pengintai debug; dimatikan (sumber crash 0x10F82). Aktifkan hanya untuk riset
 static const bool ON_TOOLS   = true;   // cheat, kunci cuaca/jam, teleport lewat file GTA3All.txt
+static const bool ON_SYMDUMP = true;   // tulis daftar simbol anim/kamera libR1.so ke GTA3All_syms.txt (sekali saja, hapus file untuk ulang)
 
 // ================= KAMERA =================
-static const float FOV_MULT      = 1.15f;  // 1.0 = normal, lebih besar = lebih lebar
+static const float FOV_MULT      = 1.55f;  // 1.0 = normal; 1.55 ~ FOV GTA SA (45 -> ~70). Turunkan (mis. 1.3) kalau terasa terlalu lebar
 static const bool  USE_MOUSE_CAM = false;  // eksperimen, belum tentu merespon sentuhan
 
 // ================= SAKSI =================
@@ -309,9 +311,61 @@ namespace tools {
     }
 }
 
+// ---------------------------------------------------------------- SYMDUMP (diagnostik)
+// Menulis nama simbol libR1.so yang mengandung kata kunci (Anim, CCam, ...) ke teks biasa,
+// supaya modul animasi/kamera berikutnya bisa ditulis dengan nama fungsi yang benar,
+// tanpa perlu mengirim libR1.so. Hanya membaca tabel simbol; tidak mengubah game.
+namespace symdump {
+    struct Ctx { FILE* out; int count; int total; };
+    static const char* NEEDLES[] = { "Anim", "CCam", "Stomp", "Kick", "Fight", nullptr };   // cocok dengan nama ter-mangle (_ZN4CCam..., _ZN7CCamera...)
+    static bool match(const char* s) {
+        for (int i = 0; NEEDLES[i]; i++) if (strstr(s, NEEDLES[i])) return true;
+        return false;
+    }
+    static int cb(struct dl_phdr_info* info, size_t, void* data) {
+        Ctx* c = (Ctx*)data;
+        if (!info->dlpi_name || !strstr(info->dlpi_name, "libR1.so")) return 0;
+        const ElfW(Dyn)* dyn = nullptr;
+        for (int i = 0; i < info->dlpi_phnum; i++)
+            if (info->dlpi_phdr[i].p_type == PT_DYNAMIC)
+                dyn = (const ElfW(Dyn)*)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+        if (!dyn) return 1;
+        uintptr_t symtab = 0, strtab = 0;
+        for (; dyn->d_tag != DT_NULL; dyn++) {
+            if (dyn->d_tag == DT_SYMTAB) symtab = dyn->d_un.d_ptr;
+            else if (dyn->d_tag == DT_STRTAB) strtab = dyn->d_un.d_ptr;
+        }
+        if (!symtab || !strtab) return 1;
+        if (symtab < info->dlpi_addr) symtab += info->dlpi_addr;   // sebagian linker memberi alamat relatif
+        if (strtab < info->dlpi_addr) strtab += info->dlpi_addr;
+        if (strtab <= symtab) return 1;
+        size_t n = (strtab - symtab) / sizeof(ElfW(Sym));          // .dynsym biasanya tepat sebelum .dynstr
+        if (n > 200000) n = 200000;
+        const ElfW(Sym)* sy = (const ElfW(Sym)*)symtab;
+        for (size_t i = 0; i < n; i++) {
+            if (sy[i].st_shndx == 0 || sy[i].st_name == 0) continue;   // lewati simbol impor
+            const char* nm = (const char*)(strtab + sy[i].st_name);
+            c->total++;
+            if (match(nm)) { fprintf(c->out, "%s\n", nm); c->count++; }
+        }
+        return 1;
+    }
+    static void run() {
+        const char* dir = aml->GetAndroidDataPath();
+        char path[512]; snprintf(path, sizeof path, "%s/GTA3All_syms.txt", dir ? dir : ".");
+        if (FILE* t = fopen(path, "r")) { fclose(t); return; }       // sudah ada, jangan ulang
+        FILE* f = fopen(path, "w"); if (!f) { logger->Error("symdump: gagal membuat %s", path); return; }
+        Ctx c = { f, 0, 0 };
+        dl_iterate_phdr(cb, &c);
+        fclose(f);
+        logger->Info("symdump: %d dari %d simbol ditulis ke %s", c.count, c.total, path);
+    }
+}
+
 extern "C" void OnModLoad() {
     gLib = aml->GetLibHandle("libR1.so");
     if (!gLib) { logger->Error("libR1.so tidak ketemu"); return; }
+    if (ON_SYMDUMP)        symdump::run();
     if (ON_CAMERA)         camera::init();
     if (ON_WITNESS)        witness::init();
     if (ON_RAGDOLL_PROBE)  ragdoll::init();
