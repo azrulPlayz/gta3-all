@@ -1,5 +1,5 @@
 // GTA III (Android 1.8, ARM32, libR1.so) - Semua mod dalam satu .so
-// Modul: kamera, saksi kejahatan, ragdoll probe, alat (cheat, cuaca, waktu, teleport via file perintah).
+// Modul: kamera, saksi kejahatan, kriminal antar-NPC, lalu lintas tertib, jam lambat, ragdoll probe, alat (cheat, cuaca, waktu, teleport via file perintah).
 // Kepadatan dan jarak pandang sengaja TIDAK ada di sini (mod terpisah).
 // Semua simbol diverifikasi dari libR1.so milik user. Tiap modul bisa dimatikan di bawah ini.
 #include <stdint.h>
@@ -22,7 +22,30 @@ static const bool ON_CAMERA  = true;
 static const bool ON_WITNESS = true;
 static const bool ON_RAGDOLL_PROBE = false;  // pengintai debug; dimatikan (sumber crash 0x10F82). Aktifkan hanya untuk riset
 static const bool ON_TOOLS   = true;   // cheat, kunci cuaca/jam, teleport lewat file GTA3All.txt
-static const bool ON_SYMDUMP = true;   // tulis daftar simbol anim/kamera libR1.so ke GTA3All_syms.txt (sekali saja, hapus file untuk ulang)
+static const bool ON_SYMDUMP = false;  // dimatikan: di libR1.so .dynstr berada sebelum .dynsym, jadi pembacaan tabel simbolnya gagal (file kosong). Daftar simbol sudah dibaca langsung dari libR1.so
+
+// ================= JAM GAME =================
+// Bawaan: 1 menit game = 1000 ms nyata (1 hari game = 24 menit). 2000 ms -> 1 hari game = 48 menit nyata.
+static const uint32_t GAME_MINUTE_MS = 2000;
+
+// ================= LALU LINTAS TERTIB =================
+static const bool  ON_TRAFFIC         = true;
+static const float TRAFFIC_SPEED_MULT = 0.80f;   // pengali kecepatan maksimum mobil NPC (1.0 = bawaan). Lebih kecil = lebih pelan/hati-hati
+
+// ================= KRIMINAL ANTAR-NPC =================
+static const bool     ON_NPC_CRIME       = true;  // NPC memukul NPC lain dianggap kejahatan; saksi sekitar bereaksi (kabur)
+static const uint32_t NPC_CRIME_COOLDOWN = 2500;  // ms, supaya pukulan beruntun tidak dihitung terus-menerus
+
+// ================= JATUH SAAT KELUAR MOBIL MELAJU =================
+static const bool     ON_CAR_FALL        = true;
+static const float    CAR_FALL_MIN_SPEED = 8.0f;   // m/s (~29 km/j). Keluar mobil di atas kecepatan ini -> pemain jatuh
+static const int      CAR_FALL_ANIM      = 43;     // AnimationId (urutan di tabel anim "man" libR1.so): 43 = FLOOR_hit_f. Alternatif: 25 = KO_skid_front, 154 = FALL_collapse
+static const int      CAR_FALL_TIME_MS   = 1500;   // lama tergeletak sebelum bangun
+
+// ================= PENGINTAI MOBIL (sementara) =================
+// Mencatat isi memori ~40 mobil pertama + ID model "taxi"/"cabbie" ke GTA3All_veh.txt (folder files/ game).
+// Gunanya hanya untuk mencari cara mengenali taxi sebelum modul penumpang taxi ditulis. Matikan setelah filenya dikirim.
+static const bool ON_VEH_PROBE = true;
 
 // ================= KAMERA =================
 static const float FOV_MULT      = 1.55f;  // 1.0 = normal; 1.55 ~ FOV GTA SA (45 -> ~70). Turunkan (mis. 1.3) kalau terasa terlalu lebar
@@ -75,15 +98,18 @@ namespace witness {
     static uint32_t* timeMs = nullptr;
 
     static CVec crimePos; static uint32_t crimeTime = 0, crimeSerial = 0; static bool hasCrime = false;
+    static void* crimeActor = nullptr;            // pelaku kejahatan NPC; dia sendiri tidak ikut kabur
+    static void* (*findPed)() = nullptr;          // FindPlayerPed
     struct Reacted { void* ped; uint32_t serial; };
     static Reacted reacted[96]; static int reactedNext = 0;
 
     static void note(int type, const CVec* pos) {
         if (!pos || !timeMs) return;
-        crimePos = *pos; crimeTime = *timeMs; crimeSerial++; hasCrime = true;
+        crimePos = *pos; crimeTime = *timeMs; crimeSerial++; hasCrime = true; crimeActor = nullptr;
         if (LOG_CRIME) logger->Info("[crime] type=%d pos=(%.1f,%.1f,%.1f) serial=%u",
                                     type, pos->x, pos->y, pos->z, crimeSerial);
     }
+    static void noteBy(void* actor, int type, const CVec* pos) { note(type, pos); crimeActor = actor; }
     static bool already(void* p) { for (auto& r : reacted) if (r.ped == p && r.serial == crimeSerial) return true; return false; }
     static void mark(void* p) { reacted[reactedNext] = { p, crimeSerial }; reactedNext = (reactedNext + 1) % 96; }
 
@@ -97,6 +123,7 @@ namespace witness {
         pcOrig(ped);
         if (!hasCrime || !timeMs) return;
         if (*timeMs - crimeTime > CRIME_WINDOW) return;
+        if (ped == crimeActor) { mark(ped); return; }
         if (already(ped)) return;
         if (!getCentre || !los || !setFlee) return;
 
@@ -126,6 +153,7 @@ namespace witness {
                       SYM("_ZN6CWorld21GetIsLineOfSightClearERK7CVectorS2_bbbbbbb");
         setFlee     = (void(*)(void*, const CVec2*, int)) SYM("_ZN4CPed7SetFleeERK9CVector2Di");
         playerCoors = (void(*)(CVec*)) SYM("_Z15FindPlayerCoorsv");
+        findPed     = (void*(*)()) SYM("_Z13FindPlayerPedv");
         timeMs      = (uint32_t*) SYM("_ZN6CTimer22m_snTimeInMillisecondsE");
         void* rc  = SYM("_ZN7CWanted13RegisterCrimeE10eCrimeTypeRK7CVectorjb");
         void* rcn = SYM("_ZN7CWanted14ReportCrimeNowE10eCrimeTypeRK7CVectorb");
@@ -135,6 +163,134 @@ namespace witness {
         if (rc)  aml->Hook(rc,  (void*)rcHook,  (void**)&rcOrig);
         if (rcn) aml->Hook(rcn, (void*)rcnHook, (void**)&rcnOrig);
         if (pc)  aml->Hook(pc,  (void*)pcHook,  (void**)&pcOrig);
+    }
+}
+
+// ---------------------------------------------------------------- KRIMINAL ANTAR-NPC
+// NPC (bukan pemain) mulai menyerang NPC lain -> dicatat sebagai kejahatan di posisi penyerang.
+// Pemain dikecualikan karena sudah ditangani sistem wanted bawaan + modul saksi di atas.
+namespace npccrime {
+    static void (*saOrig)(void*, void*) = nullptr;
+    static uint32_t lastMs = 0;
+    static void saHook(void* self, void* victim) {
+        saOrig(self, victim);
+        if (!self || !victim || !witness::findPed || !witness::timeMs || !witness::getCentre) return;
+        void* pl = witness::findPed();
+        if (self == pl || victim == pl) return;
+        uint32_t now = *witness::timeMs;
+        if (now - lastMs < NPC_CRIME_COOLDOWN) return;
+        lastMs = now;
+        CVec p; witness::getCentre(self, &p);
+        witness::noteBy(self, 100, &p);   // 100 = kode kejahatan buatan sendiri (NPC menyerang NPC), hanya untuk log
+    }
+    static void init() {
+        void* sa = SYM("_ZN4CPed9SetAttackEP7CEntity");
+        logger->Info("npccrime: SetAttack=%p", sa);
+        if (sa) aml->Hook(sa, (void*)saHook, (void**)&saOrig);
+    }
+}
+
+// ---------------------------------------------------------------- LALU LINTAS TERTIB
+// Menurunkan kecepatan maksimum mobil NPC di lalu lintas supaya tidak gaspol.
+namespace traffic {
+    static float (*msOrig)(void*) = nullptr;
+    static float msHook(void* veh) { return msOrig(veh) * TRAFFIC_SPEED_MULT; }
+    static void init() {
+        void* f = SYM("_ZN8CCarCtrl35FindMaximumSpeedForThisCarInTrafficEP8CVehicle");
+        logger->Info("traffic: FindMaximumSpeedForThisCarInTraffic=%p", f);
+        if (f) aml->Hook(f, (void*)msHook, (void**)&msOrig);
+    }
+}
+
+// ---------------------------------------------------------------- JATUH SAAT KELUAR MOBIL MELAJU
+// Kecepatan mobil diperkirakan dari perpindahan posisi pemain (tanpa baca struct mobil).
+// Saat pemain menekan keluar (CPed::SetExitCar) dan kecepatan di atas batas, setelah pemain benar-benar
+// sudah di luar mobil (FindPlayerVehicle() == null) dipanggil CPed::SetFall dengan animasi jatuh bawaan game.
+namespace carfall {
+    static void* (*findVeh)() = nullptr;
+    static void (*setFall)(void*, int, int, unsigned char) = nullptr;
+    static void (*exitOrig)(void*, void*, unsigned int) = nullptr;
+    static CVec lastPos = {0,0,0}; static uint32_t lastT = 0; static float speed = 0.0f;
+    static bool pending = false; static uint32_t pendT = 0;
+
+    static void track() {
+        if (!witness::timeMs || !witness::playerCoors) return;
+        uint32_t now = *witness::timeMs;
+        if (lastT == 0 || now - lastT >= 100) {
+            CVec p; witness::playerCoors(&p);
+            if (lastT != 0 && now > lastT) {
+                float dt = (now - lastT) / 1000.0f;
+                float dx = p.x - lastPos.x, dy = p.y - lastPos.y;
+                float v = sqrtf(dx*dx + dy*dy) / dt;
+                if (v < 60.0f) speed = v;            // lonjakan (teleport) diabaikan
+            }
+            lastPos = p; lastT = now;
+        }
+        if (pending) {
+            if (now - pendT > 4000) { pending = false; return; }
+            if (now - pendT > 200 && findVeh && !findVeh()) {   // sudah di luar mobil
+                void* pl = witness::findPed ? witness::findPed() : nullptr;
+                if (pl && setFall) {
+                    setFall(pl, CAR_FALL_TIME_MS, CAR_FALL_ANIM, 1);
+                    logger->Info("[carfall] jatuh (kecepatan keluar %.1f m/s)", speed);
+                }
+                pending = false;
+            }
+        }
+    }
+    static void exitHook(void* self, void* veh, unsigned int door) {
+        exitOrig(self, veh, door);
+        if (!self || !witness::findPed || !witness::timeMs || self != witness::findPed()) return;
+        if (speed >= CAR_FALL_MIN_SPEED) { pending = true; pendT = *witness::timeMs; }
+    }
+    static void init() {
+        findVeh = (void*(*)())                       SYM("_Z17FindPlayerVehiclev");
+        setFall = (void(*)(void*, int, int, unsigned char)) SYM("_ZN4CPed7SetFallEi11AnimationIdh");
+        void* ex = SYM("_ZN4CPed10SetExitCarEP8CVehiclej");
+        logger->Info("carfall: findVeh=%p setFall=%p exit=%p", findVeh, setFall, ex);
+        if (ex) aml->Hook(ex, (void*)exitHook, (void**)&exitOrig);
+    }
+}
+
+// ---------------------------------------------------------------- PENGINTAI MOBIL
+namespace vehprobe {
+    static const int MAXV = 40;
+    static void* seen[MAXV]; static int seenN = 0;
+    static char path[512];
+    static void* (*getMI)(const char*, int*) = nullptr;
+    static void (*pcOrig)(void*) = nullptr;
+    static bool header = false;
+
+    static void writeHeader() {
+        header = true;
+        FILE* f = fopen(path, "a"); if (!f) return;
+        const char* names[] = { "taxi", "cabbie", "idaho", "stinger", "police", nullptr };
+        for (int i = 0; names[i]; i++) {
+            int id = -1; void* mi = getMI ? getMI(names[i], &id) : nullptr;
+            fprintf(f, "MODEL %s id=%d info=%p\n", names[i], id, mi);
+        }
+        fclose(f);
+    }
+    static void pcHook(void* veh) {
+        pcOrig(veh);
+        if (seenN >= MAXV || !veh) return;
+        for (int i = 0; i < seenN; i++) if (seen[i] == veh) return;
+        seen[seenN++] = veh;
+        if (!header) writeHeader();
+        FILE* f = fopen(path, "a"); if (!f) return;
+        fprintf(f, "VEH %p", veh);
+        const uint8_t* b = (const uint8_t*)veh;
+        for (int off = 0x40; off < 0x80; off += 2) fprintf(f, " %x:%d", off, (int)*(const int16_t*)(b + off));
+        fputc('\n', f);
+        fclose(f);
+    }
+    static void init() {
+        getMI = (void*(*)(const char*, int*)) SYM("_ZN10CModelInfo12GetModelInfoEPKcPi");
+        void* pc = SYM("_ZN11CAutomobile14ProcessControlEv");
+        const char* dir = aml->GetAndroidDataPath();
+        snprintf(path, sizeof path, "%s/GTA3All_veh.txt", dir ? dir : ".");
+        logger->Info("vehprobe: GetModelInfo=%p AutomobilePC=%p file=%s", getMI, pc, path);
+        if (pc) aml->Hook(pc, (void*)pcHook, (void**)&pcOrig);
     }
 }
 
@@ -214,6 +370,7 @@ namespace tools {
     static void  (*forceWeather)(short) = nullptr;
     static void  (*setClock)(uint8_t, uint8_t) = nullptr;
     static uint8_t* clockHours = nullptr;
+    static uint32_t* msPerMinute = nullptr;   // CClock::ms_nMillisecondsPerGameMinute
     static int   lockTime = -1, lockWeather = -1, appliedWeather = -2;
     static bool  haveSaved = false; static CVec saved;
     static char  path[512];
@@ -278,6 +435,8 @@ namespace tools {
         if (consumed) { f = fopen(path, "w"); if (f) { fputs(keep, f); fclose(f); } }
     }
     static void applyLocks() {
+        // hanya ubah kalau masih nilai bawaan (1000); cheat fasttime/slowtime dibiarkan berfungsi
+        if (msPerMinute && *msPerMinute == 1000) *msPerMinute = GAME_MINUTE_MS;
         if (lockTime >= 0 && lockTime <= 23 && clockHours && setClock && *clockHours != (uint8_t)lockTime)
             setClock((uint8_t)lockTime, 0);
         if (lockWeather != appliedWeather) {
@@ -289,6 +448,7 @@ namespace tools {
     static void gameProcHook() {
         gameProcOrig();
         applyLocks();
+        if (ON_CAR_FALL) carfall::track();
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         if ((now.tv_sec - lastPoll.tv_sec) * 1000 + (now.tv_nsec - lastPoll.tv_nsec) / 1000000 >= 1000) {
             lastPoll = now; poll();
@@ -302,6 +462,7 @@ namespace tools {
         forceWeather  = (void(*)(short))      SYM("_ZN8CWeather12ForceWeatherEs");
         setClock      = (void(*)(uint8_t,uint8_t)) SYM("_ZN6CClock12SetGameClockEhh");
         clockHours    = (uint8_t*)            SYM("_ZN6CClock18ms_nGameClockHoursE");
+        msPerMinute   = (uint32_t*)           SYM("_ZN6CClock29ms_nMillisecondsPerGameMinuteE");
         void* gp      = SYM("_ZN5CGame7ProcessEv");
         const char* dir = aml->GetAndroidDataPath();
         snprintf(path, sizeof path, "%s/GTA3All.txt", dir ? dir : ".");
@@ -317,7 +478,7 @@ namespace tools {
 // tanpa perlu mengirim libR1.so. Hanya membaca tabel simbol; tidak mengubah game.
 namespace symdump {
     struct Ctx { FILE* out; int count; int total; };
-    static const char* NEEDLES[] = { "Anim", "CCam", "Stomp", "Kick", "Fight", nullptr };   // cocok dengan nama ter-mangle (_ZN4CCam..., _ZN7CCamera...)
+    static const char* NEEDLES[] = { "Anim", "CCam", "Fight", "Kick", "CPed", "CCarCtrl", "CClock", "CVehicle", "CWanted", "CPedType", "Door", "Task", nullptr };   // cocok dengan nama ter-mangle (_ZN4CCam..., _ZN7CCamera...)
     static bool match(const char* s) {
         for (int i = 0; NEEDLES[i]; i++) if (strstr(s, NEEDLES[i])) return true;
         return false;
@@ -368,6 +529,10 @@ extern "C" void OnModLoad() {
     if (ON_SYMDUMP)        symdump::run();
     if (ON_CAMERA)         camera::init();
     if (ON_WITNESS)        witness::init();
+    if (ON_NPC_CRIME)      npccrime::init();
+    if (ON_TRAFFIC)        traffic::init();
+    if (ON_VEH_PROBE)      vehprobe::init();
+    if (ON_CAR_FALL)       carfall::init();
     if (ON_RAGDOLL_PROBE)  ragdoll::init();
     if (ON_TOOLS)          tools::init();
     logger->Info("GTA3 All In One siap");
