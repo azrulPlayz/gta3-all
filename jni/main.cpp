@@ -10,6 +10,7 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <mod/amlmod.h>
 #include <mod/logger.h>
 
@@ -18,7 +19,7 @@ MYMOD(net.kamu.gta3all, GTA3 All In One, 1.0, Kamu)
 // ================= SAKLAR MODUL =================
 static const bool ON_CAMERA  = true;
 static const bool ON_WITNESS = true;
-static const bool ON_RAGDOLL_PROBE = true;   // pengintai saja, tidak mengubah game
+static const bool ON_RAGDOLL_PROBE = false;  // pengintai debug; dimatikan (sumber crash 0x10F82). Aktifkan hanya untuk riset
 static const bool ON_TOOLS   = true;   // cheat, kunci cuaca/jam, teleport lewat file GTA3All.txt
 
 // ================= KAMERA =================
@@ -144,12 +145,17 @@ namespace ragdoll {
     static void* (*skinHier)(const void*) = nullptr;
     static void* seen[MAX_PROBES]; static int seenN = 0;
 
+    // FIX: mincore() hanya cek "halaman ter-map", bukan "boleh dibaca". Halaman PROT_NONE
+    // (mis. 0x80000000 = float -0.0 di struct ped) lolos mincore lalu crash SIGSEGV/SEGV_ACCERR.
+    // write() dari memori itu ke pipe memakai hak baca sebenarnya dan mengembalikan EFAULT
+    // (bukan crash) bila tidak terbaca, jadi aman dipakai sebagai uji baca.
     static bool readable(const void* p, size_t n) {
-        uintptr_t a = (uintptr_t)p; if (a < 0x10000) return false;
-        long pg = sysconf(_SC_PAGESIZE);
-        uintptr_t st = a & ~(uintptr_t)(pg - 1); size_t len = (a + n) - st;
-        unsigned char vec[4]; if (len > (size_t)pg * 4) return false;
-        return mincore((void*)st, len, vec) == 0;
+        uintptr_t a = (uintptr_t)p; if (a < 0x10000 || n == 0 || n > 4096) return false;
+        static int fd[2] = { -1, -1 };
+        if (fd[0] < 0 && pipe2(fd, O_NONBLOCK) != 0) { fd[0] = fd[1] = -1; return false; }
+        ssize_t w = write(fd[1], p, n);
+        char tmp[1024]; while (read(fd[0], tmp, sizeof tmp) > 0) {}   // kosongkan pipe
+        return w == (ssize_t)n;
     }
     static void probe(void* ped) {
         for (int i = 0; i < seenN; i++) if (seen[i] == ped) return;
