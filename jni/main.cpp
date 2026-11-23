@@ -17,6 +17,19 @@
 
 MYMOD(net.kamu.gta3all, GTA3 All In One, 1.0, Kamu)
 
+// ================= DEBUG =================
+// Menulis kejadian penting ke GTA3All_dbg.txt (folder files/ game). Kirim file ini kalau ada fitur yang tidak jalan.
+static const bool ON_DEBUG = true;
+#include <stdarg.h>
+static char dbgPath[512]; static int dbgN = 0;
+static void dbg(const char* fmt, ...) {
+    if (!ON_DEBUG || dbgN > 700) return;
+    if (!dbgPath[0]) { const char* dir = aml->GetAndroidDataPath(); snprintf(dbgPath, sizeof dbgPath, "%s/GTA3All_dbg.txt", dir ? dir : "."); }
+    FILE* f = fopen(dbgPath, "a"); if (!f) return;
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f); fclose(f); dbgN++;
+}
+
 // ================= SAKLAR MODUL =================
 static const bool ON_CAMERA  = true;
 static const bool ON_WITNESS = true;
@@ -87,8 +100,9 @@ namespace camera {
     }
     static void (*ccOrig)(void*) = nullptr;
     static uint8_t* theCam = nullptr;           // objek TheCamera
+    static bool touchSeen = false;              // true setelah ada geseran terdeteksi; sebelum itu kamera tetap normal (tidak beku)
     static void ccHook(void* self) {
-        if (mouse3rd && (USE_MOUSE_CAM || TOUCH_LOOK)) *mouse3rd = 1;
+        if (mouse3rd && (USE_MOUSE_CAM || (TOUCH_LOOK && touchSeen))) *mouse3rd = 1;
         if (CAM_ZOOM_ON && theCam) {
             // offset dibaca dari kode SetZoomValueFollowPedScript / SetZoomValueCamStringScript:
             *(float*)(theCam + 0x144) = CAM_PED_ZOOM; theCam[0x6b] = 1;   // zoom jalan kaki + flag "pakai nilai script"
@@ -108,7 +122,10 @@ namespace camera {
         float* right = (float*)((ts && a == ts) ? d : c);   // fungsi bisa member (ada this) atau static
         if (!right) return;
         float rx = right[0], ry = right[1];
-        if ((rx != 0.0f || ry != 0.0f) && sjLog < 20) { sjLog++; logger->Info("[cam] stik kanan = %.3f, %.3f", rx, ry); }
+        if (fabsf(rx) > 0.05f || fabsf(ry) > 0.05f) {
+            if (!touchSeen) { touchSeen = true; dbg("[cam] geseran pertama terdeteksi -> mode kamera bebas aktif"); }
+            if (sjLog < 40) { sjLog++; dbg("[cam] stik kanan = %.3f, %.3f (member=%d)", rx, ry, (ts && a == ts) ? 1 : 0); }
+        }
         float* m = (float*)(mouseState + 8);
         m[0] = rx * CAM_TOUCH_SENS * (CAM_INVERT_X ? -1.0f : 1.0f);
         m[1] = ry * CAM_TOUCH_SENS * (CAM_INVERT_Y ? -1.0f : 1.0f);
@@ -121,12 +138,14 @@ namespace camera {
         theCam   = (uint8_t*)SYM("TheCamera");
         void* cc = SYM("_ZN7CCamera10CamControlEv");
         logger->Info("camera: mouse3rd=%p TheCamera=%p CamControl=%p", mouse3rd, theCam, cc);
+        dbg("[init] camera mouse3rd=%p TheCamera=%p CamControl=%p", mouse3rd, theCam, cc);
         if (cc && (USE_MOUSE_CAM || TOUCH_LOOK || CAM_ZOOM_ON)) aml->Hook(cc, (void*)ccHook, (void**)&ccOrig);
         if (TOUCH_LOOK) {
             mouseState = (uint8_t*)SYM("_ZN4CPad23NewMouseControllerStateE");
             gTouch     = (void**)  SYM("GTouchscreen");
             void* sj   = SYM("_ZN11Touchscreen13SetupJoystateERiR5RwV2dS2_");
             logger->Info("camera: mouseState=%p GTouchscreen=%p SetupJoystate=%p", mouseState, gTouch, sj);
+            dbg("[init] camera mouseState=%p GTouchscreen=%p SetupJoystate=%p", mouseState, gTouch, sj);
             if (sj && mouseState) aml->Hook(sj, (void*)sjHook, (void**)&sjOrig);
         }
     }
@@ -253,6 +272,9 @@ namespace carfall {
     static void* (*findVeh)() = nullptr;
     static void (*setFall)(void*, int, int, unsigned char) = nullptr;
     static void (*exitOrig)(void*, void*, unsigned int) = nullptr;
+    static bool tryForce(const char* via);
+    static bool inForceWindow();
+    static bool (*jdSym)(void*) = nullptr;           // alamat asli CPad::ExitVehicleJustDown (untuk polling cadangan)
     static bool (*canExitOrig)(void*) = nullptr;
     static void* (*getPad)(int) = nullptr;
     static bool (*jdOrig)(void*) = nullptr;          // CPad::ExitVehicleJustDown
@@ -263,8 +285,32 @@ namespace carfall {
     static CVec lastPos = {0,0,0}; static uint32_t lastT = 0; static float speed = 0.0f;
     static bool pending = false; static uint32_t pendT = 0;
 
+    // Dari GTA3All_veh.txt: ID model mobil ada di int16 pada mobil+0x60 (taxi=110, cabbie=128, police=116).
+    static inline int modelOf(void* veh) { return veh ? (int)*(const int16_t*)((const uint8_t*)veh + 0x60) : -1; }
+    static inline bool isTaxi(void* veh) { int m = modelOf(veh); return m == 110 || m == 128; }
+
+    // Pencari offset: saat pemain naik mobil, cari di memori mobil di mana pointer pemain (pengemudi) disimpan,
+    // dan di memori pemain di mana pointer mobilnya disimpan. Hasilnya hanya dicatat ke GTA3All_dbg.txt.
+    static void* lastVeh = nullptr;
+    static void scanOffsets(void* veh) {
+        void* pl = witness::findPed ? witness::findPed() : nullptr;
+        if (!veh || !pl) return;
+        const uint32_t* v = (const uint32_t*)veh; const uint32_t plv = (uint32_t)(uintptr_t)pl;
+        const uint32_t* p = (const uint32_t*)pl;  const uint32_t cvv = (uint32_t)(uintptr_t)veh;
+        for (int i = 0x40 / 4; i < 0x340 / 4; i++) if (v[i] == plv) dbg("[scan] mobil+0x%x = pointer pemain", i * 4);
+        for (int i = 0x40 / 4; i < 0x480 / 4; i++) if (p[i] == cvv) dbg("[scan] pemain+0x%x = pointer mobil", i * 4);
+    }
+
     static void track() {
         if (!witness::timeMs || !witness::playerCoors) return;
+        if (ON_DEBUG && findVeh) {
+            void* cv = findVeh();
+            if (cv && cv != lastVeh) {
+                dbg("[veh] pemain naik mobil %p model=%d%s", cv, modelOf(cv), isTaxi(cv) ? " (TAXI)" : (modelOf(cv) == 116 ? " (POLISI)" : ""));
+                scanOffsets(cv);
+            }
+            lastVeh = cv;
+        }
         uint32_t now = *witness::timeMs;
         if (lastT == 0 || now - lastT >= 100) {
             CVec p; witness::playerCoors(&p);
@@ -276,6 +322,11 @@ namespace carfall {
             }
             lastPos = p; lastT = now;
         }
+        // cadangan: kalau hook tombol tidak terpanggil, cek tombol keluar sendiri tiap frame
+        if (ALLOW_EXIT_MOVING && jdSym && getPad && findVeh && !inForceWindow() && findVeh()) {
+            void* pad = getPad(0);
+            if (pad && jdSym(pad) && !inForceWindow()) { dbg("[poll] tombol keluar ditekan"); tryForce("poll"); }
+        }
         if (pending) {
             if (now - pendT > 4000) { pending = false; return; }
             if (now - pendT > 200 && findVeh && !findVeh()) {   // sudah di luar mobil
@@ -283,6 +334,7 @@ namespace carfall {
                 if (pl && setFall) {
                     setFall(pl, CAR_FALL_TIME_MS, CAR_FALL_ANIM, 1);
                     logger->Info("[carfall] jatuh (kecepatan keluar %.1f m/s)", speed);
+                    dbg("[fall] SetFall dipanggil (kecepatan %.1f)", speed);
                 }
                 pending = false;
             }
@@ -292,6 +344,8 @@ namespace carfall {
     // Di sini, kalau mobil pemain melaju kencang dan tidak terbalik, keluar tetap diizinkan.
     static bool canExitHook(void* veh) {
         bool ok = canExitOrig(veh);
+        static int ceN = 0;
+        if (ON_DEBUG && ceN < 12 && findVeh && veh == findVeh()) { ceN++; dbg("[canExit] bawaan=%d kecepatan=%.1f", ok ? 1 : 0, speed); }
         if (ok || !ALLOW_EXIT_MOVING || !findVeh || !veh) return ok;
         if (veh != findVeh()) return ok;                  // hanya mobil yang dipakai pemain
         if (speed < CAR_FALL_MIN_SPEED) return ok;        // pelan: aturan bawaan
@@ -303,18 +357,24 @@ namespace carfall {
     // CPed::SetExitCar sendiri dan menyembunyikan tombol itu dari game selama 1,5 detik, jadi logika
     // "rem dulu baru keluar" tidak pernah jalan.
     static bool inForceWindow() { return forcedOnce && witness::timeMs && (*witness::timeMs - forcedT) < 1500; }
+    static bool tryForce(const char* via) {
+        if (!findVeh || !witness::findPed || !witness::timeMs || !setExit) return false;
+        void* veh = findVeh(); void* pl = witness::findPed();
+        if (!veh || !pl) return false;
+        if (speed < CAR_FALL_MIN_SPEED) { dbg("[exit:%s] tombol keluar, tapi kecepatan %.1f < batas %.1f -> aturan bawaan", via, speed, CAR_FALL_MIN_SPEED); return false; }
+        if (onSide && onSide(veh)) { dbg("[exit:%s] mobil terbalik -> aturan bawaan", via); return false; }
+        forcedOnce = true; forcedT = *witness::timeMs;
+        dbg("[exit:%s] PAKSA keluar, kecepatan %.1f m/s", via, speed);
+        setExit(pl, veh, 0);
+        return true;
+    }
     static bool jdHook(void* pad) {
         bool r = jdOrig(pad);
         if (!ALLOW_EXIT_MOVING || !getPad || pad != getPad(0)) return r;
         if (inForceWindow()) return false;
-        if (!r || !findVeh || !witness::findPed || !witness::timeMs || !setExit) return r;
-        void* veh = findVeh(); void* pl = witness::findPed();
-        if (!veh || !pl || speed < CAR_FALL_MIN_SPEED) return r;
-        if (onSide && onSide(veh)) return r;
-        forcedOnce = true; forcedT = *witness::timeMs;
-        logger->Info("[carfall] paksa keluar saat melaju (%.1f m/s)", speed);
-        setExit(pl, veh, 0);
-        return false;
+        if (!r) return r;
+        dbg("[hook] ExitVehicleJustDown = true");
+        return tryForce("hook") ? false : r;
     }
     static bool geHook(void* pad) {
         bool r = geOrig(pad);
@@ -323,6 +383,8 @@ namespace carfall {
     }
     static void exitHook(void* self, void* veh, unsigned int door) {
         exitOrig(self, veh, door);
+        static int exN = 0;
+        if (ON_DEBUG && exN < 20 && witness::findPed && self == witness::findPed()) { exN++; dbg("[SetExitCar] pemain, kecepatan=%.1f door=%u", speed, door); }
         if (!self || !witness::findPed || !witness::timeMs || self != witness::findPed()) return;
         if (speed >= CAR_FALL_MIN_SPEED) { pending = true; pendT = *witness::timeMs; }
     }
@@ -338,8 +400,10 @@ namespace carfall {
         getPad  = (void*(*)(int)) SYM("_ZN4CPad6GetPadEi");
         setExit = (void(*)(void*, void*, unsigned int)) ex;
         void* jd = SYM("_ZN4CPad19ExitVehicleJustDownEv");
+        jdSym = (bool(*)(void*)) jd;
         void* ge = SYM("_ZN4CPad14GetExitVehicleEv");
         logger->Info("carfall: getPad=%p exitJustDown=%p getExit=%p", getPad, jd, ge);
+        dbg("[init] carfall getPad=%p exitJustDown=%p getExit=%p setExit=%p canExit=%p findVeh=%p setFall=%p", getPad, jd, ge, ex, ce, findVeh, setFall);
         if (ALLOW_EXIT_MOVING && getPad && ex) {
             if (jd) aml->Hook(jd, (void*)jdHook, (void**)&jdOrig);
             if (ge) aml->Hook(ge, (void*)geHook, (void**)&geOrig);
@@ -623,6 +687,7 @@ extern "C" void OnModLoad() {
     if (!gLib) { logger->Error("libR1.so tidak ketemu"); return; }
     if (ON_SYMDUMP)        symdump::run();
     if (ON_CAMERA)         camera::init();
+    dbg("== GTA3All mulai | build: kamera-zoom+geser, keluar-melaju(hook+poll) ==");
     if (ON_WITNESS)        witness::init();
     if (ON_NPC_CRIME)      npccrime::init();
     if (ON_TRAFFIC)        traffic::init();
