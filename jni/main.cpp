@@ -50,7 +50,17 @@ static const bool ON_VEH_PROBE = true;
 
 // ================= KAMERA =================
 static const float FOV_MULT      = 1.55f;  // 1.0 = normal; 1.55 ~ FOV GTA SA (45 -> ~70). Turunkan (mis. 1.3) kalau terasa terlalu lebar
-static const bool  USE_MOUSE_CAM = false;  // eksperimen, belum tentu merespon sentuhan
+static const bool  USE_MOUSE_CAM = false;  // eksperimen lama (tanpa input sentuhan); biarkan false, pakai TOUCH_LOOK di bawah
+// Jarak kamera. Nilai ini dibaca dari fungsi SetZoomValue... milik libR1.so: preset jalan kaki 0.25 (dekat) / 1.7 (sedang) / 2.9 (jauh),
+// preset di mobil 0.05 / 1.9 / 3.9. Boleh diisi angka lain di antara/di luar itu. Kalau terasa kejauhan, turunkan.
+static const bool  CAM_ZOOM_ON   = true;
+static const float CAM_PED_ZOOM  = 2.9f;   // kamera saat jalan kaki
+static const float CAM_CAR_ZOOM  = 3.9f;   // kamera saat di mobil
+// Kontrol kamera ala SA: geser layar (stik kanan) memutar kamera bebas, tidak otomatis kembali ke belakang pemain.
+static const bool  TOUCH_LOOK      = true;
+static const float CAM_TOUCH_SENS  = 12.0f;  // makin besar makin cepat berputar
+static const bool  CAM_INVERT_X    = false;  // ganti true kalau arah putar kebalik (kiri-kanan)
+static const bool  CAM_INVERT_Y    = false;  // ganti true kalau arah atas-bawah kebalik
 
 // ================= SAKSI =================
 static const float    WITNESS_RADIUS = 22.0f;
@@ -76,16 +86,48 @@ namespace camera {
         return fov;
     }
     static void (*ccOrig)(void*) = nullptr;
-    static void ccHook(void* self) { if (mouse3rd) *mouse3rd = 1; ccOrig(self); }
+    static uint8_t* theCam = nullptr;           // objek TheCamera
+    static void ccHook(void* self) {
+        if (mouse3rd && (USE_MOUSE_CAM || TOUCH_LOOK)) *mouse3rd = 1;
+        if (CAM_ZOOM_ON && theCam) {
+            // offset dibaca dari kode SetZoomValueFollowPedScript / SetZoomValueCamStringScript:
+            *(float*)(theCam + 0x144) = CAM_PED_ZOOM; theCam[0x6b] = 1;   // zoom jalan kaki + flag "pakai nilai script"
+            *(float*)(theCam + 0x12c) = CAM_CAR_ZOOM; theCam[0x6c] = 1;   // zoom mobil + flag
+        }
+        ccOrig(self);
+    }
+    // Sentuhan -> kamera: nilai stik kanan dari Touchscreen::SetupJoystate dimasukkan ke status "mouse" milik game.
+    static void (*sjOrig)(void*, void*, void*, void*) = nullptr;
+    static void** gTouch = nullptr;             // pointer GTouchscreen
+    static uint8_t* mouseState = nullptr;       // CPad::NewMouseControllerState (x di +8, y di +12)
+    static int sjLog = 0;
+    static void sjHook(void* a, void* b, void* c, void* d) {
+        sjOrig(a, b, c, d);
+        if (!TOUCH_LOOK || !mouseState) return;
+        void* ts = gTouch ? *gTouch : nullptr;
+        float* right = (float*)((ts && a == ts) ? d : c);   // fungsi bisa member (ada this) atau static
+        if (!right) return;
+        float rx = right[0], ry = right[1];
+        if ((rx != 0.0f || ry != 0.0f) && sjLog < 20) { sjLog++; logger->Info("[cam] stik kanan = %.3f, %.3f", rx, ry); }
+        float* m = (float*)(mouseState + 8);
+        m[0] = rx * CAM_TOUCH_SENS * (CAM_INVERT_X ? -1.0f : 1.0f);
+        m[1] = ry * CAM_TOUCH_SENS * (CAM_INVERT_Y ? -1.0f : 1.0f);
+    }
     static void init() {
         void* fov = SYM("_ZN7CCamera10FindCamFOVEv");
         logger->Info("camera: FindCamFOV=%p", fov);
         if (fov) aml->Hook(fov, (void*)fovHook, (void**)&fovOrig);
-        if (USE_MOUSE_CAM) {
-            mouse3rd = (uint8_t*)SYM("_ZN7CCamera20m_bUseMouse3rdPersonE");
-            void* cc = SYM("_ZN7CCamera10CamControlEv");
-            logger->Info("camera: mouse3rd=%p CamControl=%p", mouse3rd, cc);
-            if (cc && mouse3rd) aml->Hook(cc, (void*)ccHook, (void**)&ccOrig);
+        mouse3rd = (uint8_t*)SYM("_ZN7CCamera20m_bUseMouse3rdPersonE");
+        theCam   = (uint8_t*)SYM("TheCamera");
+        void* cc = SYM("_ZN7CCamera10CamControlEv");
+        logger->Info("camera: mouse3rd=%p TheCamera=%p CamControl=%p", mouse3rd, theCam, cc);
+        if (cc && (USE_MOUSE_CAM || TOUCH_LOOK || CAM_ZOOM_ON)) aml->Hook(cc, (void*)ccHook, (void**)&ccOrig);
+        if (TOUCH_LOOK) {
+            mouseState = (uint8_t*)SYM("_ZN4CPad23NewMouseControllerStateE");
+            gTouch     = (void**)  SYM("GTouchscreen");
+            void* sj   = SYM("_ZN11Touchscreen13SetupJoystateERiR5RwV2dS2_");
+            logger->Info("camera: mouseState=%p GTouchscreen=%p SetupJoystate=%p", mouseState, gTouch, sj);
+            if (sj && mouseState) aml->Hook(sj, (void*)sjHook, (void**)&sjOrig);
         }
     }
 }
