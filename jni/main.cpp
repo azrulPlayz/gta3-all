@@ -41,6 +41,7 @@ static const bool     ON_CAR_FALL        = true;
 static const float    CAR_FALL_MIN_SPEED = 8.0f;   // m/s (~29 km/j). Keluar mobil di atas kecepatan ini -> pemain jatuh
 static const int      CAR_FALL_ANIM      = 43;     // AnimationId (urutan di tabel anim "man" libR1.so): 43 = FLOOR_hit_f. Alternatif: 25 = KO_skid_front, 154 = FALL_collapse
 static const int      CAR_FALL_TIME_MS   = 1500;   // lama tergeletak sebelum bangun
+static const bool     ALLOW_EXIT_MOVING  = true;   // true = boleh keluar saat mobil melaju (tanpa berhenti dulu) kalau kecepatan >= CAR_FALL_MIN_SPEED
 
 // ================= PENGINTAI MOBIL (sementara) =================
 // Mencatat isi memori ~40 mobil pertama + ID model "taxi"/"cabbie" ke GTA3All_veh.txt (folder files/ game).
@@ -210,6 +211,13 @@ namespace carfall {
     static void* (*findVeh)() = nullptr;
     static void (*setFall)(void*, int, int, unsigned char) = nullptr;
     static void (*exitOrig)(void*, void*, unsigned int) = nullptr;
+    static bool (*canExitOrig)(void*) = nullptr;
+    static void* (*getPad)(int) = nullptr;
+    static bool (*jdOrig)(void*) = nullptr;          // CPad::ExitVehicleJustDown
+    static bool (*geOrig)(void*) = nullptr;          // CPad::GetExitVehicle
+    static void (*setExit)(void*, void*, unsigned int) = nullptr;
+    static uint32_t forcedT = 0; static bool forcedOnce = false;
+    static bool (*onSide)(void*) = nullptr;
     static CVec lastPos = {0,0,0}; static uint32_t lastT = 0; static float speed = 0.0f;
     static bool pending = false; static uint32_t pendT = 0;
 
@@ -238,6 +246,39 @@ namespace carfall {
             }
         }
     }
+    // Aturan bawaan: pemain baru boleh keluar kalau mobil hampir berhenti (mobil direm dulu).
+    // Di sini, kalau mobil pemain melaju kencang dan tidak terbalik, keluar tetap diizinkan.
+    static bool canExitHook(void* veh) {
+        bool ok = canExitOrig(veh);
+        if (ok || !ALLOW_EXIT_MOVING || !findVeh || !veh) return ok;
+        if (veh != findVeh()) return ok;                  // hanya mobil yang dipakai pemain
+        if (speed < CAR_FALL_MIN_SPEED) return ok;        // pelan: aturan bawaan
+        if (onSide && onSide(veh)) return ok;             // terbalik: aturan bawaan
+        return true;
+    }
+    // Rem otomatis: saat tombol keluar ditekan, logika pemain (CPlayerPed) mengerem mobil dulu.
+    // Cara menghindarinya: kalau mobil melaju kencang, kita ambil alih tombol keluar. Kita panggil
+    // CPed::SetExitCar sendiri dan menyembunyikan tombol itu dari game selama 1,5 detik, jadi logika
+    // "rem dulu baru keluar" tidak pernah jalan.
+    static bool inForceWindow() { return forcedOnce && witness::timeMs && (*witness::timeMs - forcedT) < 1500; }
+    static bool jdHook(void* pad) {
+        bool r = jdOrig(pad);
+        if (!ALLOW_EXIT_MOVING || !getPad || pad != getPad(0)) return r;
+        if (inForceWindow()) return false;
+        if (!r || !findVeh || !witness::findPed || !witness::timeMs || !setExit) return r;
+        void* veh = findVeh(); void* pl = witness::findPed();
+        if (!veh || !pl || speed < CAR_FALL_MIN_SPEED) return r;
+        if (onSide && onSide(veh)) return r;
+        forcedOnce = true; forcedT = *witness::timeMs;
+        logger->Info("[carfall] paksa keluar saat melaju (%.1f m/s)", speed);
+        setExit(pl, veh, 0);
+        return false;
+    }
+    static bool geHook(void* pad) {
+        bool r = geOrig(pad);
+        if (r && getPad && pad == getPad(0) && inForceWindow()) return false;
+        return r;
+    }
     static void exitHook(void* self, void* veh, unsigned int door) {
         exitOrig(self, veh, door);
         if (!self || !witness::findPed || !witness::timeMs || self != witness::findPed()) return;
@@ -246,9 +287,21 @@ namespace carfall {
     static void init() {
         findVeh = (void*(*)())                       SYM("_Z17FindPlayerVehiclev");
         setFall = (void(*)(void*, int, int, unsigned char)) SYM("_ZN4CPed7SetFallEi11AnimationIdh");
+        onSide  = (bool(*)(void*))                   SYM("_ZN8CVehicle11IsOnItsSideEv");
         void* ex = SYM("_ZN4CPed10SetExitCarEP8CVehiclej");
-        logger->Info("carfall: findVeh=%p setFall=%p exit=%p", findVeh, setFall, ex);
+        void* ce = SYM("_ZN8CVehicle13CanPedExitCarEv");
+        logger->Info("carfall: findVeh=%p setFall=%p exit=%p canExit=%p onSide=%p", findVeh, setFall, ex, ce, onSide);
         if (ex) aml->Hook(ex, (void*)exitHook, (void**)&exitOrig);
+        if (ce && ALLOW_EXIT_MOVING) aml->Hook(ce, (void*)canExitHook, (void**)&canExitOrig);
+        getPad  = (void*(*)(int)) SYM("_ZN4CPad6GetPadEi");
+        setExit = (void(*)(void*, void*, unsigned int)) ex;
+        void* jd = SYM("_ZN4CPad19ExitVehicleJustDownEv");
+        void* ge = SYM("_ZN4CPad14GetExitVehicleEv");
+        logger->Info("carfall: getPad=%p exitJustDown=%p getExit=%p", getPad, jd, ge);
+        if (ALLOW_EXIT_MOVING && getPad && ex) {
+            if (jd) aml->Hook(jd, (void*)jdHook, (void**)&jdOrig);
+            if (ge) aml->Hook(ge, (void*)geHook, (void**)&geOrig);
+        }
     }
 }
 
