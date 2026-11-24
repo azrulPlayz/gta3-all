@@ -73,6 +73,8 @@ static const uint32_t POLICE_REAR_DOOR   = 10;        // node pintu belakang kan
 static const bool  ON_PASSENGER_ENTER     = true;
 static const float PASSENGER_MAX_CAR_SPEED = 3.0f;   // m/s; mobil yang masih melaju lebih cepat dari ini tidak bisa dinaiki
 static const float PASSENGER_REACH         = 3.2f;   // m dari pusat mobil
+static const bool  ON_HAIL                 = true;   // mobil NPC yang melaju bisa dihentikan: tekan tombol masuk saat ada mobil melaju di dekatmu, mobilnya berhenti, lalu kamu naik
+static const float HAIL_RANGE              = 14.0f;  // m; jarak maksimal mobil yang bisa dihentikan
 
 // ================= PENGINTAI MOBIL (sementara) =================
 // Mencatat isi memori ~40 mobil pertama + ID model "taxi"/"cabbie" ke GTA3All_veh.txt (folder files/ game).
@@ -601,24 +603,61 @@ namespace live {
         if (lat > 0) return lon >= 0 ? 9 : 10;
         return lon >= 0 ? 0 : 12;
     }
+    static void* hailCar = nullptr; static uint32_t hailT = 0;       // mobil yang sedang dipanggil berhenti
+    static void* boardCar = nullptr; static uint32_t boardT = 0;     // mobil yang sedang dinaiki pemain (setelah naik, lalu lintas lanjut)
     static bool tryEnterPassenger() {
         if (!ON_LIVE || !ON_PASSENGER_ENTER || !setEnter || mPos < 0 || !witness::playerCoors || !witness::timeMs || !witness::findPed) return false;
         uint32_t t = now(); CVec P; witness::playerCoors(&P);
-        TVeh* best = nullptr; float bd = PASSENGER_REACH;
+        TVeh* nearV = nullptr; float nd = PASSENGER_REACH;       // mobil yang sedang berhenti di dekat
+        TVeh* movV = nullptr;  float md = HAIL_RANGE;            // mobil yang sedang melaju di dekat
         for (auto& e : vehs) {
             if (!e.v || t - e.t > 500 || e.v == lastPlayerVeh) continue;
-            float d = d2d(e.pos, P); if (d < bd) { bd = d; best = &e; }
+            float d = d2d(e.pos, P);
+            bool driven = e.movedT != 0 && t - e.movedT <= 25000;      // pernah melaju = kemungkinan ada sopir NPC
+            if (e.speed <= PASSENGER_MAX_CAR_SPEED) { if (driven && d < nd) { nd = d; nearV = &e; } }
+            else if (driven && d < md && carfall::modelOf(e.v) != policeModel) { md = d; movV = &e; }
         }
-        if (!best) return false;
-        if (best->speed > PASSENGER_MAX_CAR_SPEED) { dbg("[penumpang] mobil terlalu cepat (%.1f m/s)", best->speed); return false; }
-        if (best->movedT == 0 || t - best->movedT > 25000) return false;      // tidak pernah melaju = tanpa sopir -> aturan bawaan
-        int door = doorFor(*best, P);
-        if (door == 0) { dbg("[penumpang] dekat pintu sopir -> aturan bawaan"); return false; }
         void* pl = witness::findPed();
         if (!pl) return false;
-        dbg("[penumpang] naik: mobil=%p model=%d pintu=%d jarak=%.1f", best->v, carfall::modelOf(best->v), door, bd);
-        setEnter(pl, best->v, (unsigned int)door);
-        return true;
+        if (nearV) {
+            int door = doorFor(*nearV, P);
+            if (door == 0) { dbg("[penumpang] dekat pintu sopir -> aturan bawaan"); return false; }
+            dbg("[penumpang] naik: mobil=%p model=%d pintu=%d jarak=%.1f", nearV->v, carfall::modelOf(nearV->v), door, nd);
+            setEnter(pl, nearV->v, (unsigned int)door);
+            boardCar = nearV->v; boardT = t;
+            return true;
+        }
+        if (ON_HAIL && movV && gotoCoors) {
+            hailCar = movV->v; hailT = t;
+            gotoCoors(hailCar, P, false);                              // mobil diarahkan berhenti di posisi pemain
+            dbg("[penumpang] menyetop mobil %p model=%d kecepatan=%.1f jarak=%.1f", hailCar, carfall::modelOf(hailCar), movV->speed, md);
+            return true;
+        }
+        return false;
+    }
+    static void hailTick(uint32_t t) {
+        if (hailCar) {
+            if (!vehAlive(hailCar) || t - hailT > 20000) {
+                dbg("[penumpang] mobil yang disetop hilang/kelamaan");
+                if (vehAlive(hailCar) && joinRoad) joinRoad(hailCar);
+                hailCar = nullptr;
+            } else {
+                TVeh* e = vehE(hailCar); CVec P; witness::playerCoors(&P);
+                if (e->speed < 1.0f && d2d(e->pos, P) < 5.5f && setEnter && witness::findPed) {
+                    int door = mPos >= 0 ? doorFor(*e, P) : 12;
+                    if (door == 0) door = 12;                          // sisi sopir -> pintu belakang kiri
+                    void* pl = witness::findPed();
+                    dbg("[penumpang] mobil berhenti, naik lewat pintu %d", door);
+                    if (pl) setEnter(pl, hailCar, (unsigned int)door);
+                    boardCar = hailCar; boardT = t; hailCar = nullptr;
+                }
+            }
+        }
+        if (boardCar) {
+            void* pv = carfall::findVeh ? carfall::findVeh() : nullptr;
+            if (pv == boardCar) { if (joinRoad) joinRoad(boardCar); dbg("[penumpang] sudah di dalam, mobil jalan lagi"); boardCar = nullptr; }
+            else if (t - boardT > 8000) boardCar = nullptr;
+        }
     }
 
     // ---- tumpangan
@@ -792,6 +831,7 @@ namespace live {
         for (auto& p : pend) if (p.car && t >= p.at) { if (vehAlive(p.car) && joinRoad) joinRoad(p.car); p.car = nullptr; }
         rideTick(t);
         policeTick(t);
+        hailTick(t);
     }
     static void init() {
         seekCar   = (void(*)(void*, void*, unsigned int)) SYM("_ZN4CPed10SetSeekCarEP8CVehiclej");
