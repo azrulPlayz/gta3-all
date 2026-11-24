@@ -39,7 +39,7 @@ static const bool ON_SYMDUMP = false;  // dimatikan: di libR1.so .dynstr berada 
 
 // ================= JAM GAME =================
 // Bawaan: 1 menit game = 1000 ms nyata (1 hari game = 24 menit). 2000 ms -> 1 hari game = 48 menit nyata.
-static const uint32_t GAME_MINUTE_MS = 2000;
+static const uint32_t GAME_MINUTE_MS = 4000;
 
 // ================= LALU LINTAS TERTIB =================
 static const bool  ON_TRAFFIC         = true;
@@ -314,7 +314,8 @@ namespace traffic {
 // Saat pemain menekan keluar (CPed::SetExitCar) dan kecepatan di atas batas, setelah pemain benar-benar
 // sudah di luar mobil (FindPlayerVehicle() == null) dipanggil CPed::SetFall dengan animasi jatuh bawaan game.
 // Offset pointer pengemudi di objek mobil. Dikalibrasi otomatis saat pemain naik mobil SEBAGAI PENGEMUDI.
-static int   g_driverOff = -1;
+static int   g_driverOff = 0x1a8;   // dari GTA3All_dbg.txt: mobil+0x1a8 = pointer pengemudi (cocok di semua kejadian pemain mengemudi)
+static bool  g_driverChecked = false;
 static void* g_passengerVeh = nullptr;   // mobil yang dinaiki pemain sebagai penumpang (jangan dipakai untuk kalibrasi)
 namespace carfall {
     static void* (*findVeh)() = nullptr;
@@ -349,18 +350,19 @@ namespace carfall {
         for (int i = 0x40 / 4; i < 0x480 / 4; i++) if (p[i] == cvv) dbg("[scan] pemain+0x%x = pointer mobil", i * 4);
     }
 
-    // Pemain duduk di kursi pengemudi -> pointer pemain tersimpan di field pengemudi mobil (field terendah yang cocok;
-    // array penumpang ada sesudahnya). Tidak dikalibrasi kalau pemain naik lewat fitur penumpang.
+    // Verifikasi offset pengemudi: saat pemain naik mobil sebagai pengemudi, mobil+g_driverOff harus berisi pointer pemain.
+    // (Offset lain seperti 0xf8/0xfc kadang ikut cocok tapi hanya sebentar, jadi tidak dipakai.)
     static void calibrateDriver(void* veh) {
-        if (g_driverOff >= 0 || !veh || veh == g_passengerVeh) return;
+        if (g_driverChecked || !veh || veh == g_passengerVeh || g_driverOff < 0) return;
         void* pl = witness::findPed ? witness::findPed() : nullptr;
         if (!pl) return;
-        const uint32_t* v = (const uint32_t*)veh; const uint32_t plv = (uint32_t)(uintptr_t)pl;
-        for (int i = 0x40 / 4; i < 0x340 / 4; i++) if (v[i] == plv) {
-            g_driverOff = i * 4;
-            dbg("[sopir] offset pengemudi dikalibrasi: mobil+0x%x", g_driverOff);
-            logger->Info("driver offset = 0x%x", g_driverOff);
-            return;
+        uint32_t cur = *(const uint32_t*)((const uint8_t*)veh + g_driverOff);
+        if (cur == (uint32_t)(uintptr_t)pl) {
+            g_driverChecked = true;
+            dbg("[sopir] offset pengemudi 0x%x terverifikasi", g_driverOff);
+        } else {
+            dbg("[sopir] offset pengemudi 0x%x TIDAK cocok (isi=%08x) -> fitur penumpang dimatikan", g_driverOff, cur);
+            g_driverOff = -1; g_driverChecked = true;
         }
     }
 
@@ -685,7 +687,17 @@ namespace live {
     static uint32_t pRideExitT = 0; static CVec pRideDest;
     static bool ridingPassenger() { return pRideCar != nullptr; }
     static bool passengerExitPress(void* veh) {
-        if (!pRideCar || veh != pRideCar || !witness::timeMs) return false;
+        if (!veh || !witness::timeMs) return false;
+        if (!pRideCar) {
+            // pemain di mobil yang pengemudinya bukan pemain (mis. keadaan setengah-duduk): tetap perlakukan sebagai penumpang
+            void* pl0 = witness::findPed ? witness::findPed() : nullptr;
+            if (g_driverOff < 0 || !pl0) return false;
+            void* d = *(void**)((uint8_t*)veh + g_driverOff);
+            if (!d || d == pl0) return false;
+            pRideCar = veh; pRideHaveDest = false; pRideExiting = false;
+            dbg("[penumpang] tombol keluar di mobil orang lain -> diperlakukan sebagai penumpang");
+        }
+        if (veh != pRideCar) return false;
         if (!pRideExiting) {
             pRideExiting = true; pRideExitT = *witness::timeMs; pRideHaveDest = false;
             TVeh* ve = vehE(pRideCar);
