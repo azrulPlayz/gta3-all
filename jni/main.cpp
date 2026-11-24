@@ -68,11 +68,12 @@ static const uint32_t POLICE_COOLDOWN_MS = 60000;
 static const uint32_t POLICE_REAR_DOOR   = 10;        // node pintu belakang kanan (RF=9, RR=10, LF=11, LR=12); ganti 12 untuk kiri
 
 // ================= PEMAIN NUMPANG =================
-// Tekan tombol masuk dekat mobil NPC yang berhenti: dekat pintu belakang -> duduk belakang, pintu depan kanan -> duduk depan,
-// pintu sopir -> tetap aturan bawaan (mengemudi/merampas).
+// Tekan tombol masuk dekat mobil NPC: kalau ADA sopir -> pemain naik sebagai penumpang seperti NPC (game memilih pintu dan kursi
+// sesuai jenis mobil). Kalau TIDAK ada sopir -> aturan bawaan (masuk dan mengemudi). Mobil polisi tidak bisa dinaiki sebagai penumpang.
 static const bool  ON_PASSENGER_ENTER     = true;
 static const float PASSENGER_MAX_CAR_SPEED = 3.0f;   // m/s; mobil yang masih melaju lebih cepat dari ini tidak bisa dinaiki
 static const float PASSENGER_REACH         = 3.2f;   // m dari pusat mobil
+static const bool  PASSENGER_USE_REAR      = false;  // hanya dipakai kalau SetSeekCar tidak ada (cadangan). Jalur utama: game memilih pintu/kursi sendiri seperti untuk NPC
 static const bool  ON_HAIL                 = true;   // mobil NPC yang melaju bisa dihentikan: tekan tombol masuk saat ada mobil melaju di dekatmu, mobilnya berhenti, lalu kamu naik
 static const float HAIL_RANGE              = 14.0f;  // m; jarak maksimal mobil yang bisa dihentikan
 
@@ -193,7 +194,7 @@ namespace camera {
 }
 
 // ---------------------------------------------------------------- SAKSI
-namespace live { static void seenPed(void*); static void seenVeh(void*); static void onFight(void*, void*); static bool tryEnterPassenger(); }
+namespace live { static void seenPed(void*); static void seenVeh(void*); static void onFight(void*, void*); static bool tryEnterPassenger(); static bool passengerExitPress(void*); static bool ridingPassenger(); }
 namespace witness {
     static void (*getCentre)(void*, CVec*) = nullptr;
     static bool (*los)(const CVec&, const CVec&, bool,bool,bool,bool,bool,bool,bool) = nullptr;
@@ -312,6 +313,9 @@ namespace traffic {
 // Kecepatan mobil diperkirakan dari perpindahan posisi pemain (tanpa baca struct mobil).
 // Saat pemain menekan keluar (CPed::SetExitCar) dan kecepatan di atas batas, setelah pemain benar-benar
 // sudah di luar mobil (FindPlayerVehicle() == null) dipanggil CPed::SetFall dengan animasi jatuh bawaan game.
+// Offset pointer pengemudi di objek mobil. Dikalibrasi otomatis saat pemain naik mobil SEBAGAI PENGEMUDI.
+static int   g_driverOff = -1;
+static void* g_passengerVeh = nullptr;   // mobil yang dinaiki pemain sebagai penumpang (jangan dipakai untuk kalibrasi)
 namespace carfall {
     static void* (*findVeh)() = nullptr;
     static void (*setFall)(void*, int, int, unsigned char) = nullptr;
@@ -345,13 +349,29 @@ namespace carfall {
         for (int i = 0x40 / 4; i < 0x480 / 4; i++) if (p[i] == cvv) dbg("[scan] pemain+0x%x = pointer mobil", i * 4);
     }
 
+    // Pemain duduk di kursi pengemudi -> pointer pemain tersimpan di field pengemudi mobil (field terendah yang cocok;
+    // array penumpang ada sesudahnya). Tidak dikalibrasi kalau pemain naik lewat fitur penumpang.
+    static void calibrateDriver(void* veh) {
+        if (g_driverOff >= 0 || !veh || veh == g_passengerVeh) return;
+        void* pl = witness::findPed ? witness::findPed() : nullptr;
+        if (!pl) return;
+        const uint32_t* v = (const uint32_t*)veh; const uint32_t plv = (uint32_t)(uintptr_t)pl;
+        for (int i = 0x40 / 4; i < 0x340 / 4; i++) if (v[i] == plv) {
+            g_driverOff = i * 4;
+            dbg("[sopir] offset pengemudi dikalibrasi: mobil+0x%x", g_driverOff);
+            logger->Info("driver offset = 0x%x", g_driverOff);
+            return;
+        }
+    }
+
     static void track() {
         if (!witness::timeMs || !witness::playerCoors) return;
-        if (ON_DEBUG && findVeh) {
+        if (findVeh) {
             void* cv = findVeh();
             if (cv && cv != lastVeh) {
-                dbg("[veh] pemain naik mobil %p model=%d%s", cv, modelOf(cv), isTaxi(cv) ? " (TAXI)" : (modelOf(cv) == 116 ? " (POLISI)" : ""));
-                scanOffsets(cv);
+                if (ON_DEBUG) dbg("[veh] pemain naik mobil %p model=%d%s", cv, modelOf(cv), isTaxi(cv) ? " (TAXI)" : (modelOf(cv) == 116 ? " (POLISI)" : ""));
+                if (ON_DEBUG) scanOffsets(cv);
+                calibrateDriver(cv);
             }
             lastVeh = cv;
         }
@@ -367,7 +387,7 @@ namespace carfall {
             lastPos = p; lastT = now;
         }
         // cadangan: kalau hook tombol tidak terpanggil, cek tombol keluar sendiri tiap frame
-        if (ALLOW_EXIT_MOVING && jdSym && getPad && findVeh && !inForceWindow() && findVeh()) {
+        if (ALLOW_EXIT_MOVING && jdSym && getPad && findVeh && !inForceWindow() && findVeh() && !live::ridingPassenger()) {
             void* pad = getPad(0);
             if (pad && jdSym(pad) && !inForceWindow()) { dbg("[poll] tombol keluar ditekan"); tryForce("poll"); }
         }
@@ -419,7 +439,11 @@ namespace carfall {
         if (!r) return r;
         dbg("[hook] ExitVehicleJustDown = true (%s)", (findVeh && findVeh()) ? "di mobil" : "jalan kaki");
         void* veh = findVeh ? findVeh() : nullptr;
-        if (veh) return (ALLOW_EXIT_MOVING && tryForce("hook")) ? false : r;
+        if (veh) {
+            // pemain sedang numpang di mobil NPC: tombol keluar = mobil berhenti dulu, lalu turun
+            if (live::passengerExitPress(veh)) { forcedOnce = true; forcedT = *witness::timeMs; return false; }
+            return (ALLOW_EXIT_MOVING && tryForce("hook")) ? false : r;
+        }
         if (ON_PASSENGER_ENTER && witness::timeMs && live::tryEnterPassenger()) {   // jalan kaki: coba naik sebagai penumpang
             forcedOnce = true; forcedT = *witness::timeMs;
             return false;
@@ -603,27 +627,48 @@ namespace live {
         if (lat > 0) return lon >= 0 ? 9 : 10;
         return lon >= 0 ? 0 : 12;
     }
+    // Apakah ada sopir di mobil ini? Pakai pointer pengemudi asli (dikalibrasi). Belum terkalibrasi -> tidak tahu.
+    static bool driverKnown() { return g_driverOff >= 0; }
+    static bool hasDriver(void* veh) {
+        if (g_driverOff < 0 || !veh) return false;
+        void* d = *(void**)((uint8_t*)veh + g_driverOff);
+        return d != nullptr;
+    }
+    // Pilih pintu masuk penumpang. 9 = depan kanan (kursi penumpang depan). Sisi sopir (0) TIDAK lagi merampas sopir:
+    // pemain diarahkan duduk di kursi penumpang. Pintu belakang hanya kalau PASSENGER_USE_REAR.
+    static int pickDoor(int raw) {
+        if (raw == 9 || raw == 0) return 9;
+        return PASSENGER_USE_REAR ? raw : 9;
+    }
+    // Naik seperti NPC: pemain memakai jalur yang sama dengan NPC tumpangan (CPed::SetSeekCar, pintu = 0).
+    // Game sendiri yang memilih pintu dan kursi sesuai jenis mobil (2 pintu, 4 pintu, van, taksi), jadi posisi duduk benar.
+    // SetEnterCar manual hanya cadangan kalau SetSeekCar tidak ada.
+    static void boardPlayer(void* pl, void* veh) {
+        if (seekCar) seekCar(pl, veh, 0);
+        else if (setEnter) setEnter(pl, veh, (unsigned int)pickDoor(9));
+    }
     static void* hailCar = nullptr; static uint32_t hailT = 0;       // mobil yang sedang dipanggil berhenti
     static void* boardCar = nullptr; static uint32_t boardT = 0;     // mobil yang sedang dinaiki pemain (setelah naik, lalu lintas lanjut)
     static bool tryEnterPassenger() {
-        if (!ON_LIVE || !ON_PASSENGER_ENTER || !setEnter || mPos < 0 || !witness::playerCoors || !witness::timeMs || !witness::findPed) return false;
+        if (!ON_LIVE || !ON_PASSENGER_ENTER || (!seekCar && !setEnter) || !witness::playerCoors || !witness::timeMs || !witness::findPed) return false;
         uint32_t t = now(); CVec P; witness::playerCoors(&P);
         TVeh* nearV = nullptr; float nd = PASSENGER_REACH;       // mobil yang sedang berhenti di dekat
         TVeh* movV = nullptr;  float md = HAIL_RANGE;            // mobil yang sedang melaju di dekat
         for (auto& e : vehs) {
             if (!e.v || t - e.t > 500 || e.v == lastPlayerVeh) continue;
             float d = d2d(e.pos, P);
-            bool driven = e.movedT != 0 && t - e.movedT <= 25000;      // pernah melaju = kemungkinan ada sopir NPC
-            if (e.speed <= PASSENGER_MAX_CAR_SPEED) { if (driven && d < nd) { nd = d; nearV = &e; } }
+            bool driven = hasDriver(e.v);                                // ada sopir sungguhan (bukan tebakan "pernah melaju")
+            if (e.speed <= PASSENGER_MAX_CAR_SPEED) { if (driven && d < nd && carfall::modelOf(e.v) != policeModel) { nd = d; nearV = &e; } }
             else if (driven && d < md && carfall::modelOf(e.v) != policeModel) { md = d; movV = &e; }
         }
         void* pl = witness::findPed();
         if (!pl) return false;
+        if (!driverKnown()) { static bool warned = false; if (!warned) { warned = true; dbg("[penumpang] offset sopir belum dikalibrasi (naik satu mobil sebagai pengemudi dulu) -> aturan bawaan"); } return false; }
         if (nearV) {
-            int door = doorFor(*nearV, P);
-            if (door == 0) { dbg("[penumpang] dekat pintu sopir -> aturan bawaan"); return false; }
-            dbg("[penumpang] naik: mobil=%p model=%d pintu=%d jarak=%.1f", nearV->v, carfall::modelOf(nearV->v), door, nd);
-            setEnter(pl, nearV->v, (unsigned int)door);
+            g_passengerVeh = nearV->v;
+            dbg("[penumpang] ada sopir -> naik seperti NPC (pintu dipilih game): mobil=%p model=%d%s jarak=%.1f",
+                nearV->v, carfall::modelOf(nearV->v), carfall::isTaxi(nearV->v) ? " (taksi)" : "", nd);
+            boardPlayer(pl, nearV->v);
             boardCar = nearV->v; boardT = t;
             return true;
         }
@@ -635,6 +680,58 @@ namespace live {
         }
         return false;
     }
+    // ---- pemain sebagai penumpang (setelah naik): mobil jalan ke tujuan; tombol keluar = berhenti dulu, lalu turun
+    static void* pRideCar = nullptr; static bool pRideExiting = false, pRideHaveDest = false;
+    static uint32_t pRideExitT = 0; static CVec pRideDest;
+    static bool ridingPassenger() { return pRideCar != nullptr; }
+    static bool passengerExitPress(void* veh) {
+        if (!pRideCar || veh != pRideCar || !witness::timeMs) return false;
+        if (!pRideExiting) {
+            pRideExiting = true; pRideExitT = *witness::timeMs; pRideHaveDest = false;
+            TVeh* ve = vehE(pRideCar);
+            if (ve && gotoCoors) gotoCoors(pRideCar, ve->pos, false);      // mobil berhenti di tempat
+            dbg("[penumpang] tombol keluar -> mobil berhenti dulu, lalu turun");
+        }
+        return true;
+    }
+    static void passengerRideTick(uint32_t t) {
+        if (!setExit || !witness::findPed || !carfall::findVeh) return;
+        void* pv = carfall::findVeh();
+        void* pl = witness::findPed();
+        if (!pRideCar) {
+            if (pv && pl && pv == g_passengerVeh && g_driverOff >= 0 && hasDriver(pv) &&
+                *(void**)((uint8_t*)pv + g_driverOff) != pl) {
+                pRideCar = pv; pRideExiting = false; pRideHaveDest = false;
+                TVeh* ve = vehE(pv); CVec dest;
+                if (ve && gotoCoors && pickFar(ve->pos, &dest, 70.0f, 180.0f, pv)) {
+                    pRideDest = dest; pRideHaveDest = true; gotoCoors(pv, dest, false);
+                    dbg("[penumpang] duduk sebagai penumpang -> mobil menuju (%.0f,%.0f)", dest.x, dest.y);
+                } else {
+                    if (joinRoad) joinRoad(pv);
+                    dbg("[penumpang] duduk sebagai penumpang -> mobil lanjut lalu lintas");
+                }
+            }
+            return;
+        }
+        if (!pv || pv != pRideCar) {                               // pemain sudah di luar mobil
+            dbg("[penumpang] pemain turun");
+            if (vehAlive(pRideCar) && joinRoad) joinRoad(pRideCar);
+            pRideCar = nullptr; g_passengerVeh = nullptr; pRideExiting = false;
+            return;
+        }
+        TVeh* ve = vehE(pRideCar);
+        if (pRideExiting) {
+            if ((ve && ve->speed < 1.0f) || t - pRideExitT > 6000) {
+                dbg("[penumpang] turun (kecepatan %.1f)", ve ? ve->speed : -1.0f);
+                if (pl) setExit(pl, pRideCar, 0);
+                pRideExiting = false;                              // pRideCar dibersihkan saat pemain benar-benar di luar
+            }
+        } else if (pRideHaveDest && ve && d2d(ve->pos, pRideDest) < 18.0f) {
+            gotoCoors(pRideCar, ve->pos, false); pRideHaveDest = false;
+            dbg("[penumpang] sampai tujuan, mobil berhenti");
+        }
+    }
+
     static void hailTick(uint32_t t) {
         if (hailCar) {
             if (!vehAlive(hailCar) || t - hailT > 20000) {
@@ -644,18 +741,17 @@ namespace live {
             } else {
                 TVeh* e = vehE(hailCar); CVec P; witness::playerCoors(&P);
                 if (e->speed < 1.0f && d2d(e->pos, P) < 5.5f && setEnter && witness::findPed) {
-                    int door = mPos >= 0 ? doorFor(*e, P) : 12;
-                    if (door == 0) door = 12;                          // sisi sopir -> pintu belakang kiri
                     void* pl = witness::findPed();
-                    dbg("[penumpang] mobil berhenti, naik lewat pintu %d", door);
-                    if (pl) setEnter(pl, hailCar, (unsigned int)door);
+                    dbg("[penumpang] mobil berhenti, naik seperti NPC (model=%d)", carfall::modelOf(hailCar));
+                    g_passengerVeh = hailCar;
+                    if (pl) boardPlayer(pl, hailCar);
                     boardCar = hailCar; boardT = t; hailCar = nullptr;
                 }
             }
         }
         if (boardCar) {
             void* pv = carfall::findVeh ? carfall::findVeh() : nullptr;
-            if (pv == boardCar) { if (joinRoad) joinRoad(boardCar); dbg("[penumpang] sudah di dalam, mobil jalan lagi"); boardCar = nullptr; }
+            if (pv == boardCar) { dbg("[penumpang] sudah di dalam"); boardCar = nullptr; }   // tujuan mobil diatur passengerRideTick
             else if (t - boardT > 8000) boardCar = nullptr;
         }
     }
@@ -832,6 +928,7 @@ namespace live {
         rideTick(t);
         policeTick(t);
         hailTick(t);
+        passengerRideTick(t);
     }
     static void init() {
         seekCar   = (void(*)(void*, void*, unsigned int)) SYM("_ZN4CPed10SetSeekCarEP8CVehiclej");
