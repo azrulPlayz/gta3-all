@@ -56,10 +56,28 @@ static const int      CAR_FALL_ANIM      = 43;     // AnimationId (urutan di tab
 static const int      CAR_FALL_TIME_MS   = 1500;   // lama tergeletak sebelum bangun
 static const bool     ALLOW_EXIT_MOVING  = true;   // true = boleh keluar saat mobil melaju (tanpa berhenti dulu) kalau kecepatan >= CAR_FALL_MIN_SPEED
 
+// ================= KOTA HIDUP: numpang mobil + polisi menangkap =================
+static const bool     ON_LIVE            = true;
+static const bool     ON_RIDES           = true;      // NPC jalan kaki sesekali numpang mobil NPC lain (taxi diutamakan)
+static const uint32_t RIDE_MIN_MS        = 25000;     // jeda acak antar tumpangan
+static const uint32_t RIDE_MAX_MS        = 70000;
+static const bool     ON_POLICE_EVENT    = true;      // NPC berantem -> mobil polisi datang, pelaku masuk kursi belakang
+static const int      POLICE_CHANCE      = 70;        // % berantem yang berujung polisi
+static const uint32_t POLICE_DELAY_MS    = 9000;      // berantem selama ini baru polisi dipanggil
+static const uint32_t POLICE_COOLDOWN_MS = 60000;
+static const uint32_t POLICE_REAR_DOOR   = 10;        // node pintu belakang kanan (RF=9, RR=10, LF=11, LR=12); ganti 12 untuk kiri
+
+// ================= PEMAIN NUMPANG =================
+// Tekan tombol masuk dekat mobil NPC yang berhenti: dekat pintu belakang -> duduk belakang, pintu depan kanan -> duduk depan,
+// pintu sopir -> tetap aturan bawaan (mengemudi/merampas).
+static const bool  ON_PASSENGER_ENTER     = true;
+static const float PASSENGER_MAX_CAR_SPEED = 3.0f;   // m/s; mobil yang masih melaju lebih cepat dari ini tidak bisa dinaiki
+static const float PASSENGER_REACH         = 3.2f;   // m dari pusat mobil
+
 // ================= PENGINTAI MOBIL (sementara) =================
 // Mencatat isi memori ~40 mobil pertama + ID model "taxi"/"cabbie" ke GTA3All_veh.txt (folder files/ game).
 // Gunanya hanya untuk mencari cara mengenali taxi sebelum modul penumpang taxi ditulis. Matikan setelah filenya dikirim.
-static const bool ON_VEH_PROBE = true;
+static const bool ON_VEH_PROBE = false;   // sudah selesai dipakai; pelacak mobil sekarang ada di modul KOTA HIDUP
 
 // ================= KAMERA =================
 static const float FOV_MULT      = 1.55f;  // 1.0 = normal; 1.55 ~ FOV GTA SA (45 -> ~70). Turunkan (mis. 1.3) kalau terasa terlalu lebar
@@ -101,7 +119,24 @@ namespace camera {
     static void (*ccOrig)(void*) = nullptr;
     static uint8_t* theCam = nullptr;           // objek TheCamera
     static bool touchSeen = false;              // true setelah ada geseran terdeteksi; sebelum itu kamera tetap normal (tidak beku)
+    // Saat pemain mati/ditangkap, semua pengaturan kamera kita dilepas supaya kamera bawaan (kamera mati/respawn) bekerja normal.
+    static void* players = nullptr;                    // CWorld::Players (pemain 0)
+    static bool (*isDeadFn)(void*) = nullptr;          // CPlayerInfo::IsRestartingAfterDeath
+    static bool (*isBustedFn)(void*) = nullptr;        // CPlayerInfo::IsRestartingAfterArrest
+    static bool lastWasted = false;
     static void ccHook(void* self) {
+        bool wasted = false;
+        if (players && isDeadFn   && isDeadFn(players))   wasted = true;
+        if (players && isBustedFn && isBustedFn(players)) wasted = true;
+        if (wasted) {
+            if (!lastWasted) dbg("[cam] pemain mati/ditangkap -> pengaturan kamera dilepas");
+            lastWasted = true;
+            if (theCam) { theCam[0x6b] = 0; theCam[0x6c] = 0; }
+            if (mouse3rd && !USE_MOUSE_CAM) *mouse3rd = 0;
+            ccOrig(self);
+            return;
+        }
+        if (lastWasted) { lastWasted = false; dbg("[cam] pemain hidup lagi -> pengaturan kamera dipasang lagi"); }
         if (mouse3rd && (USE_MOUSE_CAM || (TOUCH_LOOK && touchSeen))) *mouse3rd = 1;
         if (CAM_ZOOM_ON && theCam) {
             // offset dibaca dari kode SetZoomValueFollowPedScript / SetZoomValueCamStringScript:
@@ -136,6 +171,10 @@ namespace camera {
         if (fov) aml->Hook(fov, (void*)fovHook, (void**)&fovOrig);
         mouse3rd = (uint8_t*)SYM("_ZN7CCamera20m_bUseMouse3rdPersonE");
         theCam   = (uint8_t*)SYM("TheCamera");
+        players    = SYM("_ZN6CWorld7PlayersE");
+        isDeadFn   = (bool(*)(void*)) SYM("_ZN11CPlayerInfo22IsRestartingAfterDeathEv");
+        isBustedFn = (bool(*)(void*)) SYM("_ZN11CPlayerInfo23IsRestartingAfterArrestEv");
+        dbg("[init] camera players=%p isDead=%p isBusted=%p", players, (void*)isDeadFn, (void*)isBustedFn);
         void* cc = SYM("_ZN7CCamera10CamControlEv");
         logger->Info("camera: mouse3rd=%p TheCamera=%p CamControl=%p", mouse3rd, theCam, cc);
         dbg("[init] camera mouse3rd=%p TheCamera=%p CamControl=%p", mouse3rd, theCam, cc);
@@ -152,6 +191,7 @@ namespace camera {
 }
 
 // ---------------------------------------------------------------- SAKSI
+namespace live { static void seenPed(void*); static void seenVeh(void*); static void onFight(void*, void*); static bool tryEnterPassenger(); }
 namespace witness {
     static void (*getCentre)(void*, CVec*) = nullptr;
     static bool (*los)(const CVec&, const CVec&, bool,bool,bool,bool,bool,bool,bool) = nullptr;
@@ -183,6 +223,7 @@ namespace witness {
     static void (*pcOrig)(void*) = nullptr;
     static void pcHook(void* ped) {
         pcOrig(ped);
+        live::seenPed(ped);
         if (!hasCrime || !timeMs) return;
         if (*timeMs - crimeTime > CRIME_WINDOW) return;
         if (ped == crimeActor) { mark(ped); return; }
@@ -239,6 +280,7 @@ namespace npccrime {
         if (!self || !victim || !witness::findPed || !witness::timeMs || !witness::getCentre) return;
         void* pl = witness::findPed();
         if (self == pl || victim == pl) return;
+        live::onFight(self, victim);
         uint32_t now = *witness::timeMs;
         if (now - lastMs < NPC_CRIME_COOLDOWN) return;
         lastMs = now;
@@ -370,11 +412,17 @@ namespace carfall {
     }
     static bool jdHook(void* pad) {
         bool r = jdOrig(pad);
-        if (!ALLOW_EXIT_MOVING || !getPad || pad != getPad(0)) return r;
+        if (!getPad || pad != getPad(0)) return r;
         if (inForceWindow()) return false;
         if (!r) return r;
-        dbg("[hook] ExitVehicleJustDown = true");
-        return tryForce("hook") ? false : r;
+        dbg("[hook] ExitVehicleJustDown = true (%s)", (findVeh && findVeh()) ? "di mobil" : "jalan kaki");
+        void* veh = findVeh ? findVeh() : nullptr;
+        if (veh) return (ALLOW_EXIT_MOVING && tryForce("hook")) ? false : r;
+        if (ON_PASSENGER_ENTER && witness::timeMs && live::tryEnterPassenger()) {   // jalan kaki: coba naik sebagai penumpang
+            forcedOnce = true; forcedT = *witness::timeMs;
+            return false;
+        }
+        return r;
     }
     static bool geHook(void* pad) {
         bool r = geOrig(pad);
@@ -404,7 +452,7 @@ namespace carfall {
         void* ge = SYM("_ZN4CPad14GetExitVehicleEv");
         logger->Info("carfall: getPad=%p exitJustDown=%p getExit=%p", getPad, jd, ge);
         dbg("[init] carfall getPad=%p exitJustDown=%p getExit=%p setExit=%p canExit=%p findVeh=%p setFall=%p", getPad, jd, ge, ex, ce, findVeh, setFall);
-        if (ALLOW_EXIT_MOVING && getPad && ex) {
+        if ((ALLOW_EXIT_MOVING || ON_PASSENGER_ENTER) && getPad && ex) {
             if (jd) aml->Hook(jd, (void*)jdHook, (void**)&jdOrig);
             if (ge) aml->Hook(ge, (void*)geHook, (void**)&geOrig);
         }
@@ -432,6 +480,7 @@ namespace vehprobe {
     }
     static void pcHook(void* veh) {
         pcOrig(veh);
+        live::seenVeh(veh);
         if (seenN >= MAXV || !veh) return;
         for (int i = 0; i < seenN; i++) if (seen[i] == veh) return;
         seen[seenN++] = veh;
@@ -450,6 +499,318 @@ namespace vehprobe {
         snprintf(path, sizeof path, "%s/GTA3All_veh.txt", dir ? dir : ".");
         logger->Info("vehprobe: GetModelInfo=%p AutomobilePC=%p file=%s", getMI, pc, path);
         if (pc) aml->Hook(pc, (void*)pcHook, (void**)&pcOrig);
+    }
+}
+
+// ---------------------------------------------------------------- KOTA HIDUP
+// 1) NPC jalan kaki sesekali numpang mobil NPC lain (taxi diutamakan): mobil dipanggil ke posisi NPC, NPC naik,
+//    diantar ke tujuan, turun, lalu mobil kembali ke lalu lintas.
+// 2) NPC berantem cukup lama -> mobil polisi dipanggil, polisi turun, pelaku masuk kursi belakang mobil polisi.
+// Semua pointer NPC/mobil dicek "masih hidup" (terlihat dalam 0,5 detik terakhir) sebelum dipakai.
+namespace live {
+    struct TPed { void* p; CVec pos; uint32_t t, tPos; };
+    struct TVeh { void* v; CVec pos; uint32_t t, tPos, movedT; float speed; };
+    static TPed peds[160]; static TVeh vehs[120];
+
+    static void (*seekCar)(void*, void*, unsigned int) = nullptr;     // CPed::SetSeekCar
+    static void (*clearAll)(void*) = nullptr;                         // CPed::ClearAll
+    static void (*setWander)(void*, signed char) = nullptr;           // CPed::SetWanderPath
+    static void (*gotoCoors)(void*, CVec, bool) = nullptr;            // CCarCtrl::JoinCarWithRoadSystemGotoCoors
+    static void (*joinRoad)(void*) = nullptr;                         // CCarCtrl::JoinCarWithRoadSystem
+    static void (*tellLeave)(void*) = nullptr;                        // CCarAI::TellOccupantsToLeaveCar
+    static void (*genEmerg)(unsigned int, CVec) = nullptr;            // CCarCtrl::GenerateOneEmergencyServicesCar
+    static void (*setExit)(void*, void*, unsigned int) = nullptr;     // CPed::SetExitCar
+    static void* (*getMI)(const char*, int*) = nullptr;
+    static void (*vcOrig)(void*) = nullptr;
+    static int policeModel = -1; static bool miInit = false;
+
+    static inline uint32_t now() { return witness::timeMs ? *witness::timeMs : 0; }
+    static float d2d(const CVec& a, const CVec& b) { float dx = a.x - b.x, dy = a.y - b.y; return sqrtf(dx*dx + dy*dy); }
+
+    static void seenPed(void* p) {
+        if (!ON_LIVE || !p || !witness::getCentre || !witness::timeMs) return;
+        uint32_t t = *witness::timeMs;
+        TPed* slot = nullptr; TPed* oldest = &peds[0];
+        for (auto& e : peds) { if (e.p == p) { slot = &e; break; } if (e.t < oldest->t) oldest = &e; }
+        if (!slot) { slot = oldest; slot->p = p; slot->tPos = 0; }
+        if (slot->tPos == 0 || t - slot->tPos >= 200) { witness::getCentre(p, &slot->pos); slot->tPos = t; }
+        slot->t = t;
+    }
+    static void seenVeh(void* v) {
+        if (!ON_LIVE || !v || !witness::getCentre || !witness::timeMs) return;
+        uint32_t t = *witness::timeMs;
+        TVeh* slot = nullptr; TVeh* oldest = &vehs[0];
+        for (auto& e : vehs) { if (e.v == v) { slot = &e; break; } if (e.t < oldest->t) oldest = &e; }
+        if (!slot) { slot = oldest; slot->v = v; slot->tPos = 0; slot->speed = 0; slot->movedT = 0; }
+        if (slot->tPos == 0) { witness::getCentre(v, &slot->pos); slot->tPos = t; slot->speed = 0; }
+        else if (t - slot->tPos >= 300) {
+            CVec np; witness::getCentre(v, &np);
+            slot->speed = d2d(np, slot->pos) / ((t - slot->tPos) / 1000.0f);
+            slot->pos = np; slot->tPos = t;
+            if (slot->speed >= 1.5f) slot->movedT = t;      // pernah melaju = kemungkinan ada sopir NPC
+        }
+        slot->t = t;
+    }
+    static void vcHook(void* v) { vcOrig(v); seenVeh(v); }
+
+    static TPed* pedE(void* p) { if (!p) return nullptr; for (auto& e : peds) if (e.p == p) return &e; return nullptr; }
+    static TVeh* vehE(void* v) { if (!v) return nullptr; for (auto& e : vehs) if (e.v == v) return &e; return nullptr; }
+    static bool pedAlive(void* p) { TPed* e = pedE(p); return e && now() - e->t <= 500; }
+    static bool vehAlive(void* v) { TVeh* e = vehE(v); return e && now() - e->t <= 500; }
+    static bool onFoot(const TPed& e) {
+        uint32_t t = now();
+        for (auto& v : vehs) { if (!v.v || t - v.t > 500) continue; if (d2d(e.pos, v.pos) < 2.4f) return false; }
+        return true;
+    }
+    static bool pickFar(const CVec& from, CVec* out, float minD, float maxD, void* exclude) {
+        TVeh* pick = nullptr; int c = 0; uint32_t t = now();
+        for (auto& e : vehs) {
+            if (!e.v || t - e.t > 1500 || e.v == exclude) continue;
+            float d = d2d(e.pos, from); if (d < minD || d > maxD) continue;
+            if (carfall::modelOf(e.v) == policeModel) continue;
+            if (rand() % (++c) == 0) pick = &e;
+        }
+        if (!pick) return false;
+        *out = pick->pos;
+        return true;
+    }
+
+    // ---- pemain numpang
+    static void (*setEnter)(void*, void*, unsigned int) = nullptr;   // CPed::SetEnterCar
+    static int mPos = -1;                 // offset posisi di matriks mobil (sumbu kanan = -0x30, depan = -0x10), dideteksi saat jalan
+    static void* lastPlayerVeh = nullptr;
+    static uint32_t lastMatrixTry = 0;
+    static bool detectMatrix(void* v, const CVec& c) {
+        const uint8_t* b = (const uint8_t*)v;
+        for (int off = 0x34; off <= 0x60; off += 4) {
+            const float* f = (const float*)(b + off);
+            if (fabsf(f[0] - c.x) > 2.0f || fabsf(f[1] - c.y) > 2.0f || fabsf(f[2] - c.z) > 2.0f) continue;
+            const float* r = (const float*)(b + off - 0x30); const float* a = (const float*)(b + off - 0x10);
+            float lr = r[0]*r[0] + r[1]*r[1] + r[2]*r[2], la = a[0]*a[0] + a[1]*a[1] + a[2]*a[2];
+            float dt = r[0]*a[0] + r[1]*a[1] + r[2]*a[2];
+            if (fabsf(lr - 1.0f) < 0.05f && fabsf(la - 1.0f) < 0.05f && fabsf(dt) < 0.05f) { mPos = off; return true; }
+        }
+        return false;
+    }
+    // node pintu (eCarNodes): RF=9, RR=10, LF=11 (sopir), LR=12. Mengembalikan 0 = sisi sopir (serahkan ke game).
+    static int doorFor(const TVeh& e, const CVec& P) {
+        const uint8_t* b = (const uint8_t*)e.v;
+        const float* r = (const float*)(b + mPos - 0x30); const float* f = (const float*)(b + mPos - 0x10);
+        float dx = P.x - e.pos.x, dy = P.y - e.pos.y;
+        float lat = dx * r[0] + dy * r[1], lon = dx * f[0] + dy * f[1];
+        if (lat > 0) return lon >= 0 ? 9 : 10;
+        return lon >= 0 ? 0 : 12;
+    }
+    static bool tryEnterPassenger() {
+        if (!ON_LIVE || !ON_PASSENGER_ENTER || !setEnter || mPos < 0 || !witness::playerCoors || !witness::timeMs || !witness::findPed) return false;
+        uint32_t t = now(); CVec P; witness::playerCoors(&P);
+        TVeh* best = nullptr; float bd = PASSENGER_REACH;
+        for (auto& e : vehs) {
+            if (!e.v || t - e.t > 500 || e.v == lastPlayerVeh) continue;
+            float d = d2d(e.pos, P); if (d < bd) { bd = d; best = &e; }
+        }
+        if (!best) return false;
+        if (best->speed > PASSENGER_MAX_CAR_SPEED) { dbg("[penumpang] mobil terlalu cepat (%.1f m/s)", best->speed); return false; }
+        if (best->movedT == 0 || t - best->movedT > 25000) return false;      // tidak pernah melaju = tanpa sopir -> aturan bawaan
+        int door = doorFor(*best, P);
+        if (door == 0) { dbg("[penumpang] dekat pintu sopir -> aturan bawaan"); return false; }
+        void* pl = witness::findPed();
+        if (!pl) return false;
+        dbg("[penumpang] naik: mobil=%p model=%d pintu=%d jarak=%.1f", best->v, carfall::modelOf(best->v), door, bd);
+        setEnter(pl, best->v, (unsigned int)door);
+        return true;
+    }
+
+    // ---- tumpangan
+    enum { R_IDLE, R_PICK, R_RIDE, R_DROP };
+    static int rs = R_IDLE; static void* rPed = nullptr; static void* rCar = nullptr;
+    static uint32_t rT = 0, nextRide = 0, rNear = 0; static CVec rDest;
+
+    // ---- polisi
+    enum { P_IDLE, P_WAIT, P_COME, P_DRIVE, P_ARREST, P_BOARD };
+    static int ps = P_IDLE; static void *pAtk = nullptr, *pVic = nullptr, *pCar = nullptr;
+    static uint32_t pT = 0, nextPol = 0, pNear = 0; static CVec pPos;
+    static void* preCars[16]; static int nPre = 0; static void* cops[4]; static int nCops = 0;
+
+    // mobil yang harus dikembalikan ke lalu lintas setelah beberapa detik
+    struct Pend { void* car; uint32_t at; }; static Pend pend[6];
+    static void pendRoad(void* car, uint32_t at) { for (auto& p : pend) if (!p.car) { p.car = car; p.at = at; return; } }
+
+    static bool busyPed(void* p) {
+        if (p == rPed || p == pAtk || p == pVic) return true;
+        for (int i = 0; i < nCops; i++) if (cops[i] == p) return true;
+        return false;
+    }
+    static void releasePed(void* p) { if (pedAlive(p) && clearAll) { clearAll(p); if (setWander) setWander(p, (signed char)(rand() % 8)); } }
+
+    static void rideAbort(const char* why) {
+        dbg("[tumpangan] batal: %s", why);
+        releasePed(rPed);
+        if (vehAlive(rCar) && joinRoad) joinRoad(rCar);
+        rs = R_IDLE; rPed = rCar = nullptr;
+    }
+
+    static void rideTick(uint32_t t) {
+        if (!ON_RIDES || !seekCar || !gotoCoors || !joinRoad || !clearAll || !setExit) return;
+        CVec P; witness::playerCoors(&P);
+        void* pveh = carfall::findVeh ? carfall::findVeh() : nullptr;
+        switch (rs) {
+        case R_IDLE: {
+            if (t < nextRide) return;
+            nextRide = t + RIDE_MIN_MS + (uint32_t)(rand() % (int)(RIDE_MAX_MS - RIDE_MIN_MS));
+            TVeh* best = nullptr; TVeh* taxi = nullptr; int cnt = 0;
+            for (auto& e : vehs) {
+                if (!e.v || t - e.t > 400 || e.v == pveh || e.v == pCar) continue;
+                int m = carfall::modelOf(e.v);
+                if (m == policeModel) continue;
+                float d = d2d(e.pos, P);
+                if (d < 12.0f || d > 60.0f || e.speed < 1.5f) continue;     // harus sedang dikemudikan NPC
+                if (carfall::isTaxi(e.v)) taxi = &e;
+                if (rand() % (++cnt) == 0) best = &e;
+            }
+            if (taxi && (rand() % 100) < 70) best = taxi;
+            if (!best) return;
+            TPed* bp = nullptr; float bd = 30.0f;
+            for (auto& e : peds) {
+                if (!e.p || t - e.t > 400 || busyPed(e.p)) continue;
+                if (d2d(e.pos, P) < 3.0f || !onFoot(e)) continue;           // bukan pemain, bukan yang sedang di mobil
+                float d = d2d(e.pos, best->pos);
+                if (d < bd) { bd = d; bp = &e; }
+            }
+            if (!bp) return;
+            rPed = bp->p; rCar = best->v; rT = t; rNear = 0; rs = R_PICK;
+            gotoCoors(rCar, bp->pos, false);          // mobil menuju NPC
+            seekCar(rPed, rCar, 0);                   // NPC menuju mobil (pintu dipilih game)
+            dbg("[tumpangan] mulai: ped=%p mobil=%p model=%d jarak=%.1f", rPed, rCar, carfall::modelOf(rCar), bd);
+            break; }
+        case R_PICK: {
+            TPed* pe = pedE(rPed); TVeh* ve = vehE(rCar);
+            if (!pedAlive(rPed) || !vehAlive(rCar)) { rideAbort("ped/mobil hilang"); return; }
+            if (t - rT > 35000) { rideAbort("kelamaan menjemput"); return; }
+            if (d2d(pe->pos, ve->pos) < 1.15f) {
+                if (!rNear) rNear = t;
+                else if (t - rNear > 1000) {
+                    CVec dest;
+                    if (!pickFar(ve->pos, &dest, 70.0f, 180.0f, rCar)) { dbg("[tumpangan] naik, tapi tidak ada tujuan"); setExit(rPed, rCar, 0); rs = R_DROP; rT = t; return; }
+                    rDest = dest; gotoCoors(rCar, rDest, false); rs = R_RIDE; rT = t;
+                    dbg("[tumpangan] naik -> menuju (%.0f,%.0f)", dest.x, dest.y);
+                }
+            } else rNear = 0;
+            break; }
+        case R_RIDE: {
+            TVeh* ve = vehE(rCar);
+            if (!vehAlive(rCar)) { dbg("[tumpangan] mobil hilang (keluar jangkauan), selesai"); rs = R_IDLE; rPed = rCar = nullptr; return; }
+            if (d2d(ve->pos, rDest) < 18.0f || t - rT > 100000) { setExit(rPed, rCar, 0); rs = R_DROP; rT = t; dbg("[tumpangan] sampai, turun"); }
+            break; }
+        case R_DROP:
+            if (t - rT > 3500) { releasePed(rPed); if (vehAlive(rCar)) joinRoad(rCar); rs = R_IDLE; rPed = rCar = nullptr; }
+            break;
+        }
+    }
+
+    static void policeFinish(const char* why) {
+        dbg("[polisi] selesai: %s", why);
+        ps = P_IDLE; pAtk = pVic = pCar = nullptr; nCops = 0; nextPol = now() + POLICE_COOLDOWN_MS;
+    }
+    static void onFight(void* a, void* b) {
+        if (!ON_LIVE || !ON_POLICE_EVENT || ps != P_IDLE || !genEmerg || !witness::timeMs) return;
+        uint32_t t = now(); if (t < nextPol) return;
+        if (rand() % 100 >= POLICE_CHANCE) { nextPol = t + 15000; return; }
+        if (!pedAlive(a) || !pedAlive(b) || a == rPed || b == rPed) return;
+        pAtk = a; pVic = b; pT = t; ps = P_WAIT; pPos = pedE(a)->pos;
+        dbg("[polisi] berantem terdeteksi: pelaku=%p korban=%p -> polisi dipanggil dalam %u ms", a, b, (unsigned)POLICE_DELAY_MS);
+    }
+    static void policeTick(uint32_t t) {
+        if (!ON_POLICE_EVENT || ps == P_IDLE) return;
+        if (!seekCar || !gotoCoors || !joinRoad || !clearAll || !tellLeave || !genEmerg) { ps = P_IDLE; return; }
+        switch (ps) {
+        case P_WAIT:
+            if (!pedAlive(pAtk)) { policeFinish("pelaku hilang"); return; }
+            if (t - pT < POLICE_DELAY_MS) return;
+            if (policeModel < 0) { policeFinish("ID model polisi tidak ada"); return; }
+            pPos = pedE(pAtk)->pos; nPre = 0;
+            for (auto& v : vehs) if (v.v && carfall::modelOf(v.v) == policeModel && nPre < 16) preCars[nPre++] = v.v;
+            genEmerg((unsigned int)policeModel, pPos);
+            ps = P_COME; pT = t; dbg("[polisi] mobil polisi dibuat di sekitar (%.0f,%.0f)", pPos.x, pPos.y);
+            break;
+        case P_COME:
+            for (auto& v : vehs) {
+                if (!v.v || t - v.t > 400 || carfall::modelOf(v.v) != policeModel) continue;
+                bool old = false; for (int i = 0; i < nPre; i++) if (preCars[i] == v.v) old = true;
+                if (old || d2d(v.pos, pPos) > 500.0f) continue;
+                pCar = v.v; gotoCoors(pCar, pPos, false); ps = P_DRIVE; pT = t;
+                dbg("[polisi] mobil polisi %p menuju TKP", pCar); return;
+            }
+            if (t - pT > 20000) policeFinish("mobil polisi tidak muncul");
+            break;
+        case P_DRIVE: {
+            if (!vehAlive(pCar)) { policeFinish("mobil polisi hilang"); return; }
+            TVeh* ve = vehE(pCar);
+            if (d2d(ve->pos, pPos) < 14.0f || t - pT > 45000) {
+                nCops = 0;                                    // yang duduk di mobil sekarang = polisi
+                for (auto& e : peds) {
+                    if (!e.p || t - e.t > 500 || e.p == pAtk || e.p == pVic) continue;
+                    if (d2d(e.pos, ve->pos) < 2.8f && nCops < 4) cops[nCops++] = e.p;
+                }
+                tellLeave(pCar); ps = P_ARREST; pT = t; dbg("[polisi] tiba, %d polisi turun", nCops);
+            }
+            break; }
+        case P_ARREST:
+            if (t - pT < 2500) return;
+            if (!pedAlive(pAtk)) { policeFinish("pelaku hilang"); return; }
+            clearAll(pAtk); if (pedAlive(pVic)) { clearAll(pVic); if (setWander) setWander(pVic, (signed char)(rand() % 8)); }
+            seekCar(pAtk, pCar, POLICE_REAR_DOOR);           // pelaku menyerah & masuk kursi belakang
+            ps = P_BOARD; pT = t; pNear = 0; dbg("[polisi] pelaku diperintah masuk kursi belakang");
+            break;
+        case P_BOARD: {
+            if (!pedAlive(pAtk) || !vehAlive(pCar)) { policeFinish("pelaku/mobil hilang"); return; }
+            TPed* pe = pedE(pAtk); TVeh* ve = vehE(pCar);
+            if (d2d(pe->pos, ve->pos) < 1.3f) {
+                if (!pNear) pNear = t;
+                else if (t - pNear > 1000) {
+                    for (int i = 0; i < nCops; i++) if (pedAlive(cops[i])) seekCar(cops[i], pCar, 0);   // polisi naik lagi
+                    CVec dest; bool far = pickFar(ve->pos, &dest, 70.0f, 180.0f, pCar);
+                    dbg("[polisi] pelaku sudah di mobil, polisi naik lagi");
+                    if (far) { gotoCoors(pCar, dest, false); pendRoad(pCar, t + 40000); } else pendRoad(pCar, t + 8000);
+                    policeFinish("pelaku diangkut");
+                }
+            } else pNear = 0;
+            if (t - pT > 25000) { releasePed(pAtk); policeFinish("pelaku tidak sempat masuk"); }
+            break; }
+        }
+    }
+
+    static void tick() {
+        if (!ON_LIVE || !witness::timeMs || !witness::playerCoors || !witness::getCentre) return;
+        uint32_t t = now();
+        if (!miInit && getMI && t > 5000) { miInit = true; int id = -1; getMI("police", &id); policeModel = id; dbg("[live] model polisi = %d", policeModel); }
+        if (carfall::findVeh) { void* pv = carfall::findVeh(); if (pv) lastPlayerVeh = pv; }
+        if (ON_PASSENGER_ENTER && mPos < 0 && t - lastMatrixTry > 1000) {     // cari letak matriks sekali-sekali sampai ketemu
+            lastMatrixTry = t;
+            for (auto& e : vehs) if (e.v && t - e.t < 500 && detectMatrix(e.v, e.pos)) { dbg("[init] matriks mobil terdeteksi, offset posisi=0x%x", mPos); break; }
+        }
+        for (auto& p : pend) if (p.car && t >= p.at) { if (vehAlive(p.car) && joinRoad) joinRoad(p.car); p.car = nullptr; }
+        rideTick(t);
+        policeTick(t);
+    }
+    static void init() {
+        seekCar   = (void(*)(void*, void*, unsigned int)) SYM("_ZN4CPed10SetSeekCarEP8CVehiclej");
+        clearAll  = (void(*)(void*))                      SYM("_ZN4CPed8ClearAllEv");
+        setWander = (void(*)(void*, signed char))         SYM("_ZN4CPed13SetWanderPathEa");
+        gotoCoors = (void(*)(void*, CVec, bool))          SYM("_ZN8CCarCtrl30JoinCarWithRoadSystemGotoCoorsEP8CVehicle7CVectorb");
+        joinRoad  = (void(*)(void*))                      SYM("_ZN8CCarCtrl21JoinCarWithRoadSystemEP8CVehicle");
+        tellLeave = (void(*)(void*))                      SYM("_ZN6CCarAI23TellOccupantsToLeaveCarEP8CVehicle");
+        genEmerg  = (void(*)(unsigned int, CVec))         SYM("_ZN8CCarCtrl31GenerateOneEmergencyServicesCarEj7CVector");
+        setExit   = (void(*)(void*, void*, unsigned int)) SYM("_ZN4CPed10SetExitCarEP8CVehiclej");
+        getMI     = (void*(*)(const char*, int*))         SYM("_ZN10CModelInfo12GetModelInfoEPKcPi");
+        setEnter  = (void(*)(void*, void*, unsigned int)) SYM("_ZN4CPed11SetEnterCarEP8CVehiclej");
+        dbg("[init] live seekCar=%p clearAll=%p wander=%p goto=%p road=%p leave=%p gen=%p exit=%p mi=%p",
+            (void*)seekCar, (void*)clearAll, (void*)setWander, (void*)gotoCoors, (void*)joinRoad, (void*)tellLeave, (void*)genEmerg, (void*)setExit, (void*)getMI);
+        if (!ON_VEH_PROBE) {      // pelacak mobil memasang hook sendiri kalau pengintai lama mati
+            void* pc = SYM("_ZN11CAutomobile14ProcessControlEv");
+            dbg("[init] live hook CAutomobile::ProcessControl=%p", pc);
+            if (pc) aml->Hook(pc, (void*)vcHook, (void**)&vcOrig);
+        }
     }
 }
 
@@ -608,6 +969,7 @@ namespace tools {
         gameProcOrig();
         applyLocks();
         if (ON_CAR_FALL) carfall::track();
+        if (ON_LIVE) live::tick();
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         if ((now.tv_sec - lastPoll.tv_sec) * 1000 + (now.tv_nsec - lastPoll.tv_nsec) / 1000000 >= 1000) {
             lastPoll = now; poll();
@@ -693,6 +1055,7 @@ extern "C" void OnModLoad() {
     if (ON_TRAFFIC)        traffic::init();
     if (ON_VEH_PROBE)      vehprobe::init();
     if (ON_CAR_FALL)       carfall::init();
+    if (ON_LIVE)           live::init();
     if (ON_RAGDOLL_PROBE)  ragdoll::init();
     if (ON_TOOLS)          tools::init();
     logger->Info("GTA3 All In One siap");
